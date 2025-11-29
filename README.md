@@ -1,8 +1,11 @@
-# AIGen-Replies
+<img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/e5aa6017-a321-4c5c-bdd7-e534e567585f" /># AIGen-Replies
 
 AI-powered auto-replies for WordPress comments and WooCommerce reviews — intelligent, secure, and fully controllable.
 
 ---
+![AIGen-Replies](https://github.com/user-attachments/assets/2cc95a74-eb84-4481-8e8e-909bc7d54085)
+
+
 
 ## ✨ Features
 
