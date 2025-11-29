@@ -178,7 +178,7 @@ If you find it valuable:
 
 - ⭐ Star this repo
 - 🐦 Share with fellow developers
-- ☕ Buy me a coffee → <a href="buymeacoffee.com/Mahyarrdev">click me</a>
+- ☕ Buy me a coffee → buymeacoffee.com/Mahyarrdev
 
 ## ❓ Need Help?
 
