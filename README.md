@@ -1,4 +1,74 @@
+# AIGen-Replies
 
+AI-powered auto-replies for WordPress comments and WooCommerce reviews — intelligent, secure, and fully controllable.
+
+---
+
+## ✨ Features
+
+- ✅ **Dual Support**: Handles both **standard WordPress comments** (`comment_type = ''`) and **WooCommerce product reviews** (`comment_type = 'review'`).
+- 🤖 **Multi-Provider AI**: Works with **OpenAI**, **DeepSeek**, or **[OneAPI.ir](https://one-api.ir/)** (low-cost, Iran-friendly API gateway).
+- ⚙️ **Smart Prompt Engine**: Use dynamic placeholders like `{product_title}`, `{customer_comment}`, `{short_description}`, `{attributes}`, and `{previous_replies}`.
+- 🧠 **Style Mimicry**: AI learns from your last 1–10 manual replies to match your brand’s tone.
+- ⏰ **Smart Scheduling**:  
+  - Set a **default delay** (e.g., 60 minutes).  
+  - Create **keyword-triggered rules**: if comment contains “warranty”, wait 2 hours or reply only during 09:00–17:00.
+- 🚫 **Spam & Keyword Filters**:  
+  - Block duplicate comments.  
+  - Define **forbidden keywords** (e.g., profanity).  
+  - Auto-send a **custom fallback message** instead of AI reply.
+- 💬 **Canned Responses**: Predefine answers to FAQs like “What’s your return policy?” — no API call needed.
+- 👤 **Dedicated AI User**: Auto-created admin user named `🤖 هوش مصنوعی`.
+- 📊 **AI-Powered Analysis**:  
+  - Persian-language report on customer sentiment.  
+  - Detects promoters (“I’ll buy again!”), strengths, and weaknesses.  
+  - Includes **rating distribution chart** (via Chart.js).
+- 🤔 **Human Intervention Detection**: AI self-flags risky comments → creates **admin task** + sends fallback reply.
+- 🔒 **Secure API Handling**: Keys stored only in `wp_options` — never in code, logs, or version control.
+- 🌐 **Multi-Language Ready**: Auto-detects Persian/English and replies in the same language.
+- 🧹 **Clean Uninstall**: Removes all settings, logs, and DB tables on plugin deletion.
+
+---
+
+## 📥 Installation
+
+**Option 1: Manual Upload**  
+1. Upload the `aigen-replies` folder to `/wp-content/plugins/`.  
+2. Go to **Plugins → Installed Plugins** and activate **AIGen-Replies**.  
+3. Navigate to **Smart Replies → Settings** to configure your API key.
+
+**Option 2: ZIP Upload**  
+1. Download the plugin ZIP from GitHub.  
+2. In WordPress Admin: **Plugins → Add New → Upload Plugin**.  
+3. Choose ZIP → **Install Now** → **Activate**.
+
+> 💡 **WooCommerce is optional**. Without it, the plugin works on standard post/page comments only.
+
+---
+
+## ⚙️ Configuration
+
+After activation, go to **Smart Replies → Settings**.
+
+### Required Settings
+- **API Provider**: OneAPI (recommended), OpenAI, or DeepSeek  
+- **API Key**: Get from your provider ([one-api.ir](https://one-api.ir/) for low-cost access)  
+- **Auto-Reply**: Enable to auto-respond to approved comments
+
+### Advanced Settings
+- **Model**: `gpt-4o-mini` (default), `gpt-4`, `deepseek-chat`  
+- **Temperature**: `0.1` (deterministic) to `0.9` (creative)  
+- **Max Tokens**: `50–2000`  
+- **Response Scope**: Reply to all comments, WooCommerce only, or exclude specific products/categories  
+- **Custom Prompt**: Fully editable. Example:
+  ```text
+  You are a support agent...
+  Product: {product_title}
+  Customer said: "{customer_comment}"
+  Previous replies: {previous_replies}
+  Respond in the same language and tone.
+
+  
 ## 🛠️ Smart Tools
 
 - **Live Preview**: Type sample comment, see AI response instantly
