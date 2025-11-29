@@ -1,12 +1,12 @@
 <?php
 /**
- * Plugin Name: WooCommerce AI Review Reply Pro
- * Plugin URI: https://yourwebsite.com
- * Description: پاسخ هوشمند به نظرات ووکامرس با هوش مصنوعی - نسخه پیشرفته
+ * Plugin Name: AIGen-Replies
+ * Plugin URI: 
+ * Description: پاسخ هوشمند به نظرات ووکامرس با هوش مصنوعی 
  * Version: 1.0.0
  * Author: Mahyar Soltan Mohammadi
  * License: GPL v2 or later
- * Text Domain: wc-ai-review-reply-pro
+ * Text Domain: AIGen-Replies
  * Requires Plugins: woocommerce
  */
 if (!defined('ABSPATH')) {
@@ -2736,3 +2736,4 @@ register_activation_hook(__FILE__, 'wc_ai_review_reply_pro_activate');
 function wc_ai_review_reply_pro_activate() {
 
 }
+
