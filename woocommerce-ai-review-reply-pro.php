@@ -1,0 +1,2738 @@
+<?php
+/**
+ * Plugin Name: WooCommerce AI Review Reply Pro
+ * Plugin URI: https://yourwebsite.com
+ * Description: پاسخ هوشمند به نظرات ووکامرس با هوش مصنوعی - نسخه پیشرفته
+ * Version: 1.0.0
+ * Author: Mahyar Soltan Mohammadi
+ * License: GPL v2 or later
+ * Text Domain: wc-ai-review-reply-pro
+ * Requires Plugins: woocommerce
+ */
+if (!defined('ABSPATH')) {
+    exit;
+}
+class WC_AI_Review_Reply_Pro {
+    private $options;
+    private $transient_prefix = 'wc_ai_review_';
+    private $ai_user_id = 0;
+    public function __construct() {
+        add_action('plugins_loaded', array($this, 'init'));
+        register_activation_hook(__FILE__, array($this, 'activate'));
+        register_deactivation_hook(__FILE__, array($this, 'deactivate'));
+    }
+    public function init() {
+        if (!class_exists('WooCommerce')) {
+            add_action('admin_notices', array($this, 'woocommerce_missing_notice'));
+            return;
+        }
+        $this->options = get_option('wc_ai_review_settings', array());
+        $this->ai_user_id = get_option('wc_ai_review_ai_user_id', 0);
+        // افزودن فرکانس cron جدید
+        add_filter('cron_schedules', array($this, 'add_cron_intervals'));
+        // هوک‌های مدیریت
+        add_action('admin_menu', array($this, 'add_admin_menu'));
+        add_action('admin_init', array($this, 'settings_init'));
+        add_action('admin_enqueue_scripts', array($this, 'admin_enqueue_scripts'));
+        // هوک‌های نظرات
+        add_action('comment_post', array($this, 'handle_comment_submission'), 10, 3);
+        add_action('comment_unapproved_to_approved', array($this, 'maybe_auto_reply_on_approval'));
+        add_action('wp_set_comment_status', array($this, 'handle_comment_status_change'), 10, 2);
+        // هوک‌های AJAX
+        add_action('wp_ajax_generate_ai_reply', array($this, 'generate_ai_reply_ajax'));
+        add_action('wp_ajax_test_ai_connection', array($this, 'test_ai_connection_ajax'));
+        add_action('wp_ajax_debug_plugin', array($this, 'debug_plugin_ajax'));
+        add_action('wp_ajax_get_comment_stats', array($this, 'get_comment_stats_ajax'));
+        add_action('wp_ajax_toggle_comment_exception', array($this, 'toggle_comment_exception_ajax'));
+        add_action('wp_ajax_complete_ai_task', array($this, 'complete_ai_task_ajax'));
+        add_action('wp_ajax_generate_live_preview', array($this, 'generate_live_preview_ajax'));
+        add_action('wp_ajax_generate_ai_analysis', array($this, 'generate_ai_analysis_ajax'));
+        add_action('wp_ajax_download_analysis_pdf', array($this, 'download_analysis_pdf'));
+        // افزودن cron job برای بررسی پاسخ‌های زمان‌بندی شده
+        add_action('wc_ai_review_check_scheduled_replies', array($this, 'check_scheduled_replies'));
+        // هوک‌های رابط کاربری مدیریت
+        // حذف اکشن‌های اضافی از لیست نظرات
+        // add_filter('comment_row_actions', array($this, 'add_ai_reply_action'), 10, 2); // حذف شد
+        add_action('add_meta_boxes_comment', array($this, 'add_comment_meta_box'));
+        add_action('admin_notices', array($this, 'show_admin_notices'));
+        // مدیریت محتوا
+        add_action('save_post', array($this, 'save_post_meta'), 10, 3);
+        add_action('add_meta_boxes', array($this, 'add_post_meta_boxes'));
+        // فیلتر اسپم
+        add_filter('pre_comment_approved', array($this, 'prevent_duplicate_comments'), 10, 2);
+        // نمایش هشدار در داشبورد وردپرس
+        add_action('admin_notices', array($this, 'show_human_intervention_alert'));
+    }
+    public function add_cron_intervals($schedules) {
+        $schedules['minute'] = array(
+            'interval' => 60, // هر 60 ثانیه
+            'display' => __('هر دقیقه')
+        );
+        return $schedules;
+    }
+    public function activate() {
+        $this->create_ai_user();
+        $default_options = array(
+            'api_provider' => 'oneapi',
+            'api_key' => '',
+            'oneapi_url' => 'https://api.one-api.ir/openai/v1/chat/completions',
+            'openai_url' => 'https://api.openai.com/v1/chat/completions',
+            'deepseek_url' => 'https://api.deepseek.com/v1/chat/completions',
+            'model' => 'gpt-4o-mini',
+            'temperature' => '0.7',
+            'max_tokens' => '500',
+            'auto_reply' => '0',
+            'preview_replies' => '1',
+            'reply_user' => 'ai', // 'ai' یا ID کاربر
+            'custom_prompt' => "شما یک دستیار حمایت مشتری برای یک فروشگاه اینترنتی هستید. به نظرات مشتریان به صورت مفید و جذاب پاسخ دهید.
+زبان پاسخ: همان زبان کاربر
+لحن: حرفه‌ای و دوستانه
+اگر سوال مشتری کاملاً خارج از موضوع محصول یا سایت باشد، با عذرخواهی توضیح دهید که نمی‌توانید به آن پاسخ دهید.
+اطلاعات محصول:
+عنوان: {product_title}
+توضیحات کوتاه: {short_description}
+ویژگی‌های کلیدی: {attributes}
+خلاصه: {description}
+نظر مشتری:
+\"{customer_comment}\"
+پاسخ‌های قبلی مدیر (برای یادگیری سبک):
+{previous_replies}
+حالا یک پاسخ بنویسید که با سبک و لحن پاسخ‌های قبلی همخوانی داشته باشد.",
+            'learn_from_previous' => '1',
+            'learn_count' => '4',
+            'spam_prevention' => '1',
+            'spam_action' => 'trash',
+            'excluded_categories' => array(),
+            'excluded_products' => array(),
+            'excluded_post_types' => array(),
+            'only_products' => '1',
+            'debug_mode' => '0',
+            'forbidden_keywords' => '', // <-- جدید
+            'forbidden_response' => 'با سلام و احترام، متاسفانه نظر شما حاوی محتوای نامناسب بود و نمی‌تواند منتشر شود. لطفاً از به کار بردن زبان نامناسب خودداری فرمایید. با تشکر از همراهی شما.' // <-- جدید
+        );
+        if (false === get_option('wc_ai_review_settings')) {
+            add_option('wc_ai_review_settings', $default_options);
+        }
+        $this->create_log_table();
+    }
+    public function deactivate() {
+        wp_clear_scheduled_hook('wc_ai_review_daily_maintenance');
+    }
+    public function complete_ai_task_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        $task_id = isset($_POST['task_id']) ? sanitize_text_field($_POST['task_id']) : '';
+        $tasks = get_option('_wc_ai_review_tasks', array());
+        foreach ($tasks as &$task) {
+            if ($task['id'] === $task_id) {
+                $task['status'] = 'completed';
+                break;
+            }
+        }
+        update_option('_wc_ai_review_tasks', $tasks);
+        wp_send_json_success();
+    }
+    public function woocommerce_missing_notice() {
+        echo '<div class="error"><p>' . __('WooCommerce AI Review Reply requires WooCommerce to be installed and active.', 'wc-ai-review-reply-pro') . '</p></div>';
+    }
+    private function create_ai_user() {
+        $username = 'ai_assistant';
+        $email = 'ai-assistant@' . parse_url(get_site_url(), PHP_URL_HOST);
+        if (!username_exists($username) && !email_exists($email)) {
+            $user_id = wp_create_user($username, wp_generate_password(), $email);
+            if (!is_wp_error($user_id)) {
+                $user = new WP_User($user_id);
+                $user->set_role('administrator');
+                wp_update_user(array(
+                    'ID' => $user_id,
+                    'display_name' => '🤖 هوش مصنوعی',
+                    'first_name' => 'هوش',
+                    'last_name' => 'مصنوعی',
+                    'description' => 'اکانت خودکار برای پاسخ به نظرات با هوش مصنوعی'
+                ));
+                update_option('wc_ai_review_ai_user_id', $user_id);
+                $this->ai_user_id = $user_id;
+            }
+        }
+    }
+    private function create_log_table() {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wc_ai_review_logs';
+        $charset_collate = $wpdb->get_charset_collate();
+        $sql = "CREATE TABLE IF NOT EXISTS $table_name (
+            id mediumint(9) NOT NULL AUTO_INCREMENT,
+            time datetime DEFAULT '0000-00-00 00:00:00' NOT NULL,
+            comment_id bigint(20) NOT NULL,
+            action varchar(100) NOT NULL,
+            message text NOT NULL,
+            details text,
+            PRIMARY KEY (id)
+        ) $charset_collate;";
+        require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+        dbDelta($sql);
+    }
+    private function add_log($comment_id, $action, $message, $details = '') {
+        if (!isset($this->options['debug_mode']) || $this->options['debug_mode'] !== '1') {
+            return;
+        }
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wc_ai_review_logs';
+        $wpdb->insert(
+            $table_name,
+            array(
+                'time' => current_time('mysql'),
+                'comment_id' => $comment_id,
+                'action' => $action,
+                'message' => $message,
+                'details' => is_array($details) ? serialize($details) : $details
+            )
+        );
+    }
+    public function add_admin_menu() {
+        add_menu_page(
+            'پاسخ هوشمند نظرات',
+            'پاسخ هوشمند',
+            'manage_options',
+            'wc-ai-review-reply',
+            array($this, 'admin_dashboard'),
+            'dashicons-testimonial',
+            56
+        );
+        add_submenu_page(
+            'wc-ai-review-reply',
+            'تنظیمات پاسخ هوشمند',
+            'تنظیمات',
+            'manage_options',
+            'wc-ai-review-settings',
+            array($this, 'settings_page')
+        );
+        add_submenu_page(
+            'wc-ai-review-reply',
+            'لاگ و دیباگ',
+            'دیباگ',
+            'manage_options',
+            'wc-ai-review-debug',
+            array($this, 'debug_page')
+        );
+    }
+    public function admin_enqueue_scripts($hook) {
+        // فقط در صفحات مربوط به پلاگین اسکریپت‌ها را بارگذاری کن
+        $allowed_pages = [
+            'edit-comments.php', // صفحه اصلی مدیریت نظرات
+            'comment.php', // صفحه ویرایش تک نظر
+            'admin_page_wc-ai-review-reply', // داشبورد پلاگین
+            'admin_page_wc-ai-review-settings', // تنظیمات
+            'admin_page_wc-ai-review-debug', // دیباگ
+            'admin_page_wc-ai-review-analysis', // تحلیل
+            'admin_page_wc-ai-review-tasks', // وظایف
+            'admin_page_wc-ai-review-interested' // کاربران علاقه‌مند
+        ];
+        if (!in_array($hook, $allowed_pages) && strpos($hook, 'wc-ai-review') === false) {
+            return;
+        }
+        // بارگذاری Tailwind CSS از CDN
+        wp_enqueue_style('tailwind-css', 'https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css', array(), '2.2.19');
+        // بارگذاری فونت فارسی
+        wp_enqueue_style('vazirmatn-font', 'https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css');
+        wp_enqueue_style('wc-ai-review-admin', plugin_dir_url(__FILE__) . 'admin.css', array(), '3.0.1');
+        wp_enqueue_script('wc-ai-review-admin', plugin_dir_url(__FILE__) . 'admin.js', array('jquery'), '3.0.1', true);
+        wp_localize_script('wc-ai-review-admin', 'wc_ai_review', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('wc_ai_review_nonce'),
+            'generating_text' => __('در حال تولید...', 'wc-ai-review-reply-pro'),
+            'generate_text' => __('تولید پاسخ', 'wc-ai-review-reply-pro'),
+            'preview_text' => __('پیش‌نمایش پاسخ', 'wc-ai-review-reply-pro'),
+            'post_text' => __('ارسال پاسخ', 'wc-ai-review-reply-pro'),
+            'cancel_text' => __('انصراف', 'wc-ai-review-reply-pro'),
+            'success_text' => __('عملیات با موفقیت انجام شد', 'wc-ai-review-reply-pro'),
+            'error_text' => __('خطا در انجام عملیات', 'wc-ai-review-reply-pro'),
+            'confirm_toggle_exception' => __('آیا مطمئن هستید؟ این نظر از لیست استثناها حذف/اضافه خواهد شد.', 'wc-ai-review-reply-pro')
+        ));
+    }
+    public function settings_init() {
+        register_setting('wc_ai_review', 'wc_ai_review_settings', array($this, 'sanitize_settings'));
+        // بخش تنظیمات API
+        add_settings_section(
+            'wc_ai_review_api_section',
+            __('تنظیمات API و مدل', 'wc-ai-review-reply-pro'),
+            array($this, 'api_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'api_provider',
+            __('ارائه‌دهنده API', 'wc-ai-review-reply-pro'),
+            array($this, 'api_provider_render'),
+            'wc_ai_review',
+            'wc_ai_review_api_section'
+        );
+        add_settings_field(
+            'api_key',
+            __('کلید API', 'wc-ai-review-reply-pro'),
+            array($this, 'api_key_render'),
+            'wc_ai_review',
+            'wc_ai_review_api_section'
+        );
+        add_settings_field(
+            'model',
+            __('مدل', 'wc-ai-review-reply-pro'),
+            array($this, 'model_render'),
+            'wc_ai_review',
+            'wc_ai_review_api_section'
+        );
+        add_settings_field(
+            'temperature',
+            __('دمای پاسخ‌دهی', 'wc-ai-review-reply-pro'),
+            array($this, 'temperature_render'),
+            'wc_ai_review',
+            'wc_ai_review_api_section'
+        );
+        add_settings_field(
+            'max_tokens',
+            __('حداکثر توکن', 'wc-ai-review-reply-pro'),
+            array($this, 'max_tokens_render'),
+            'wc_ai_review',
+            'wc_ai_review_api_section'
+        );
+        // بخش تنظیمات پاسخ‌دهی
+        add_settings_section(
+            'wc_ai_review_response_section',
+            __('تنظیمات پاسخ‌دهی', 'wc-ai-review-reply-pro'),
+            array($this, 'response_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'auto_reply',
+            __('پاسخ خودکار', 'wc-ai-review-reply-pro'),
+            array($this, 'auto_reply_render'),
+            'wc_ai_review',
+            'wc_ai_review_response_section'
+        );
+        add_settings_field(
+            'preview_replies',
+            __('پیش‌نمایش پاسخ‌ها', 'wc-ai-review-reply-pro'),
+            array($this, 'preview_replies_render'),
+            'wc_ai_review',
+            'wc_ai_review_response_section'
+        );
+        add_settings_field(
+            'reply_user',
+            __('کاربر پاسخ‌دهنده', 'wc-ai-review-reply-pro'),
+            array($this, 'reply_user_render'),
+            'wc_ai_review',
+            'wc_ai_review_response_section'
+        );
+        add_settings_field(
+            'custom_prompt',
+            __('پرامپت سفارشی', 'wc-ai-review-reply-pro'),
+            array($this, 'custom_prompt_render'),
+            'wc_ai_review',
+            'wc_ai_review_response_section'
+        );
+        add_settings_field(
+            'learn_from_previous',
+            __('یادگیری از پاسخ‌های قبلی', 'wc-ai-review-reply-pro'),
+            array($this, 'learn_from_previous_render'),
+            'wc_ai_review',
+            'wc_ai_review_response_section'
+        );
+        add_settings_field(
+            'learn_count',
+            __('تعداد پاسخ‌های قبلی برای یادگیری', 'wc-ai-review-reply-pro'),
+            array($this, 'learn_count_render'),
+            'wc_ai_review',
+            'wc_ai_review_response_section'
+        );
+        // بخش مدیریت اسپم
+        add_settings_section(
+            'wc_ai_review_spam_section',
+            __('مدیریت نظرات تکراری', 'wc-ai-review-reply-pro'),
+            array($this, 'spam_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'spam_prevention',
+            __('جلوگیری از نظرات تکراری', 'wc-ai-review-reply-pro'),
+            array($this, 'spam_prevention_render'),
+            'wc_ai_review',
+            'wc_ai_review_spam_section'
+        );
+        add_settings_field(
+            'spam_action',
+            __('عملکرد در برابر نظرات تکراری', 'wc-ai-review-reply-pro'),
+            array($this, 'spam_action_render'),
+            'wc_ai_review',
+            'wc_ai_review_spam_section'
+        );
+        // بخش استثناها
+        add_settings_section(
+            'wc_ai_review_exceptions_section',
+            __('استثناها', 'wc-ai-review-reply-pro'),
+            array($this, 'exceptions_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'only_products',
+            __('فقط محصولات', 'wc-ai-review-reply-pro'),
+            array($this, 'only_products_render'),
+            'wc_ai_review',
+            'wc_ai_review_exceptions_section'
+        );
+        add_settings_field(
+            'excluded_categories',
+            __('دسته‌های مستثنی', 'wc-ai-review-reply-pro'),
+            array($this, 'excluded_categories_render'),
+            'wc_ai_review',
+            'wc_ai_review_exceptions_section'
+        );
+        add_settings_field(
+            'excluded_products',
+            __('محصولات مستثنی', 'wc-ai-review-reply-pro'),
+            array($this, 'excluded_products_render'),
+            'wc_ai_review',
+            'wc_ai_review_exceptions_section'
+        );
+        add_settings_field(
+            'excluded_post_types',
+            __('انواع محتوای مستثنی', 'wc-ai-review-reply-pro'),
+            array($this, 'excluded_post_types_render'),
+            'wc_ai_review',
+            'wc_ai_review_exceptions_section'
+        );
+        // بخش دیباگ
+        add_settings_section(
+            'wc_ai_review_debug_section',
+            __('تنظیمات دیباگ', 'wc-ai-review-reply-pro'),
+            array($this, 'debug_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'debug_mode',
+            __('حالت دیباگ', 'wc-ai-review-reply-pro'),
+            array($this, 'debug_mode_render'),
+            'wc_ai_review',
+            'wc_ai_review_debug_section'
+        );
+        // بخش پاسخ‌های از پیش تعریف شده
+        add_settings_section(
+            'wc_ai_review_canned_section',
+            'پاسخ‌های از پیش تعریف شده',
+            array($this, 'canned_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'canned_responses',
+            'پاسخ‌های از پیش تعریف شده',
+            array($this, 'canned_responses_render'),
+            'wc_ai_review',
+            'wc_ai_review_canned_section'
+        );
+        // بخش کلمات کلیدی ممنوعه
+        add_settings_section(
+            'wc_ai_review_keywords_section',
+            'کلمات کلیدی ممنوعه',
+            array($this, 'keywords_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'forbidden_keywords',
+            'کلمات ممنوعه',
+            array($this, 'forbidden_keywords_render'),
+            'wc_ai_review',
+            'wc_ai_review_keywords_section'
+        );
+        // فیلد جدید: پاسخ پیش‌فرض برای کلمات ممنوعه
+        add_settings_field(
+            'forbidden_response',
+            'پاسخ پیش‌فرض برای کلمات ممنوعه',
+            array($this, 'forbidden_response_render'),
+            'wc_ai_review',
+            'wc_ai_review_keywords_section' // قرار دادن در همان بخش
+        );
+        // بخش زبان‌های پشتیبانی شده
+        add_settings_section(
+            'wc_ai_review_languages_section',
+            'پشتیبانی چندزبانه',
+            array($this, 'languages_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'supported_languages',
+            'زبان‌های پشتیبانی شده',
+            array($this, 'supported_languages_render'),
+            'wc_ai_review',
+            'wc_ai_review_languages_section'
+        );
+        add_settings_field(
+            'default_language',
+            'زبان پیش‌فرض',
+            array($this, 'default_language_render'),
+            'wc_ai_review',
+            'wc_ai_review_languages_section'
+        );
+        // هشدارهای مدیریتی
+        add_settings_section(
+            'wc_ai_review_notifications_section',
+            'هشدارهای مدیریتی',
+            array($this, 'notifications_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'enable_human_intervention_alerts',
+            'فعال‌سازی هشدار مداخله انسانی',
+            array($this, 'enable_human_intervention_alerts_render'),
+            'wc_ai_review',
+            'wc_ai_review_notifications_section'
+        );
+        add_settings_field(
+            'human_intervention_response',
+            'پاسخ سفارشی برای مداخله انسانی',
+            array($this, 'human_intervention_response_render'),
+            'wc_ai_review',
+            'wc_ai_review_notifications_section'
+        );
+        // بخش زمان‌بندی هوشمند
+        add_settings_section(
+            'wc_ai_review_scheduling_section',
+            'زمان‌بندی هوشمند پاسخ‌ها',
+            array($this, 'scheduling_section_callback'),
+            'wc_ai_review'
+        );
+        add_settings_field(
+            'default_delay',
+            'تاخیر پیش‌فرض (دقیقه)',
+            array($this, 'default_delay_render'),
+            'wc_ai_review',
+            'wc_ai_review_scheduling_section'
+        );
+        add_settings_field(
+            'scheduling_rules',
+            'قوانین زمان‌بندی',
+            array($this, 'scheduling_rules_render'),
+            'wc_ai_review',
+            'wc_ai_review_scheduling_section'
+        );
+    }
+    // تابع جدید: سنجش و پاکسازی داده‌های تنظیمات
+    public function sanitize_settings($input) {
+        $output = array();
+        // مواردی که باید به صورت رشته ذخیره شوند
+        $string_fields = array('api_provider', 'api_key', 'model', 'custom_prompt', 'forbidden_keywords', 'forbidden_response', 'human_intervention_response', 'supported_languages', 'default_language');
+        foreach ($string_fields as $field) {
+            if (isset($input[$field])) {
+                $output[$field] = sanitize_text_field($input[$field]);
+            }
+        }
+        // موارد عددی
+        $numeric_fields = array('temperature', 'max_tokens', 'learn_count', 'default_delay');
+        foreach ($numeric_fields as $field) {
+            if (isset($input[$field])) {
+                $output[$field] = floatval($input[$field]);
+            }
+        }
+        // موارد بولین (چک باکس)
+        $boolean_fields = array('auto_reply', 'preview_replies', 'learn_from_previous', 'spam_prevention', 'only_products', 'debug_mode', 'enable_human_intervention_alerts');
+        foreach ($boolean_fields as $field) {
+            $output[$field] = isset($input[$field]) ? '1' : '0';
+        }
+        // موارد آرایه‌ای
+        $array_fields = array('excluded_categories', 'excluded_products', 'excluded_post_types');
+        foreach ($array_fields as $field) {
+            if (isset($input[$field]) && is_array($input[$field])) {
+                $output[$field] = array_map('intval', $input[$field]);
+            } else {
+                $output[$field] = array();
+            }
+        }
+        // پاسخ‌های از پیش تعریف شده
+        if (isset($input['canned_responses']) && is_array($input['canned_responses'])) {
+            $output['canned_responses'] = array();
+            foreach ($input['canned_responses'] as $item) {
+                if (!empty($item['trigger']) && !empty($item['response'])) {
+                    $output['canned_responses'][] = array(
+                        'trigger' => sanitize_text_field($item['trigger']),
+                        'response' => sanitize_textarea_field($item['response'])
+                    );
+                }
+            }
+        }
+        // قوانین زمان‌بندی
+        if (isset($input['scheduling_rules']) && is_array($input['scheduling_rules'])) {
+            $output['scheduling_rules'] = array();
+            foreach ($input['scheduling_rules'] as $rule) {
+                if (!empty($rule['keywords'])) {
+                    $output['scheduling_rules'][] = array(
+                        'keywords' => sanitize_text_field($rule['keywords']),
+                        'delay' => isset($rule['delay']) ? intval($rule['delay']) : 0,
+                        'time_range' => isset($rule['time_range']) ? sanitize_text_field($rule['time_range']) : ''
+                    );
+                }
+            }
+        }
+        // عملکرد اسپم
+        if (isset($input['spam_action'])) {
+            $valid_actions = array('mark_spam', 'trash', 'delete', 'hold');
+            $output['spam_action'] = in_array($input['spam_action'], $valid_actions) ? $input['spam_action'] : 'trash';
+        }
+        // کاربر پاسخ‌دهنده
+        if (isset($input['reply_user'])) {
+            if ($input['reply_user'] === 'ai') {
+                $output['reply_user'] = 'ai';
+            } else {
+                $output['reply_user'] = intval($input['reply_user']);
+            }
+        }
+        return $output;
+    }
+    public function scheduling_section_callback() {
+        echo '<p class="text-sm text-gray-600">تنظیمات زمان‌بندی هوشمند برای ارسال پاسخ‌ها. می‌توانید قوانین شرطی بر اساس کلمات کلیدی تعریف کنید.</p>';
+    }
+    public function default_delay_render() {
+        $value = isset($this->options['default_delay']) ? intval($this->options['default_delay']) : 60; // پیش‌فرض: 60 دقیقه
+        ?>
+        <input type="number" name="wc_ai_review_settings[default_delay]" value="<?php echo esc_attr($value); ?>" min="0" max="1440" class="block w-full p-2 border border-gray-300 rounded-md" />
+        <p class="mt-2 text-xs text-gray-500">تاخیر پیش‌فرض برای ارسال پاسخ (به دقیقه). مثلاً 60 = 1 ساعت.</p>
+        <?php
+    }
+    public function scheduling_rules_render() {
+        $value = isset($this->options['scheduling_rules']) ? $this->options['scheduling_rules'] : array();
+        ?>
+        <div id="scheduling-rules-container">
+            <?php foreach ($value as $index => $rule): ?>
+                <div class="scheduling-rule-item mb-4 p-4 border border-gray-200 rounded-md">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">کلمات کلیدی</label>
+                            <input type="text" name="wc_ai_review_settings[scheduling_rules][<?php echo $index; ?>][keywords]" placeholder="کلمات کلیدی (با کاما جدا کنید)" value="<?php echo esc_attr($rule['keywords'] ?? ''); ?>" class="block w-full p-2 border border-gray-300 rounded-md" />
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">تاخیر (دقیقه)</label>
+                            <input type="number" name="wc_ai_review_settings[scheduling_rules][<?php echo $index; ?>][delay]" placeholder="0 برای فوری" value="<?php echo esc_attr($rule['delay'] ?? '0'); ?>" class="block w-full p-2 border border-gray-300 rounded-md" />
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-700 mb-1">بازه زمانی (اختیاری)</label>
+                            <input type="text" name="wc_ai_review_settings[scheduling_rules][<?php echo $index; ?>][time_range]" placeholder="مثلاً: 09:00-17:00" value="<?php echo esc_attr($rule['time_range'] ?? ''); ?>" class="block w-full p-2 border border-gray-300 rounded-md" />
+                        </div>
+                    </div>
+                    <button type="button" class="remove-scheduling-rule mt-2 px-3 py-1 bg-red-500 text-white text-xs rounded-md">حذف قانون</button>
+                </div>
+            <?php endforeach; ?>
+        </div>
+        <button type="button" id="add-scheduling-rule" class="mt-2 px-4 py-2 bg-blue-500 text-white text-sm rounded-md">+ افزودن قانون جدید</button>
+        <p class="mt-2 text-xs text-gray-500">
+            - اگر کلمه کلیدی در نظر کاربر وجود داشته باشد، این قانون اعمال می‌شود.<br>
+            - تاخیر 0 به معنای ارسال فوری است.<br>
+            - بازه زمانی اختیاری است (مثلاً 09:00-17:00). اگر تعریف شود، پاسخ فقط در این بازه ارسال می‌شود.
+        </p>
+        <script>
+            jQuery(document).ready(function($) {
+                $('#add-scheduling-rule').on('click', function() {
+                    var index = $('#scheduling-rules-container .scheduling-rule-item').length;
+                    var html = `
+                    <div class="scheduling-rule-item mb-4 p-4 border border-gray-200 rounded-md">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700 mb-1">کلمات کلیدی</label>
+                                <input type="text" name="wc_ai_review_settings[scheduling_rules][`+index+`][keywords]" placeholder="کلمات کلیدی (با کاما جدا کنید)" class="block w-full p-2 border border-gray-300 rounded-md" />
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700 mb-1">تاخیر (دقیقه)</label>
+                                <input type="number" name="wc_ai_review_settings[scheduling_rules][`+index+`][delay]" placeholder="0 برای فوری" class="block w-full p-2 border border-gray-300 rounded-md" />
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-700 mb-1">بازه زمانی (اختیاری)</label>
+                                <input type="text" name="wc_ai_review_settings[scheduling_rules][`+index+`][time_range]" placeholder="مثلاً: 09:00-17:00" class="block w-full p-2 border border-gray-300 rounded-md" />
+                            </div>
+                        </div>
+                        <button type="button" class="remove-scheduling-rule mt-2 px-3 py-1 bg-red-500 text-white text-xs rounded-md">حذف قانون</button>
+                    </div>
+                `;
+                    $('#scheduling-rules-container').append(html);
+                });
+                $(document).on('click', '.remove-scheduling-rule', function() {
+                    $(this).closest('.scheduling-rule-item').remove();
+                });
+            });
+        </script>
+        <?php
+    }
+    // رندر فیلدهای تنظیمات
+    public function api_provider_render() {
+        $value = isset($this->options['api_provider']) ? $this->options['api_provider'] : 'oneapi';
+        ?>
+        <select name="wc_ai_review_settings[api_provider]" id="api_provider" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <option value="oneapi" <?php selected($value, 'oneapi'); ?>>OneAPI (غیررسمی، هزینه کمتر)</option>
+            <option value="openai" <?php selected($value, 'openai'); ?>>OpenAI (رسمی)</option>
+            <option value="deepseek" <?php selected($value, 'deepseek'); ?>>DeepSeek</option>
+        </select>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('OneAPI یک API غیررسمی برای دسترسی به مدل‌های OpenAI با هزینه کمتر است. OpenAI و DeepSeek ارائه‌دهندگان رسمی هستند.', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function api_key_render() {
+        $value = isset($this->options['api_key']) ? $this->options['api_key'] : '';
+        ?>
+        <input type="password" name="wc_ai_review_settings[api_key]" value="<?php echo esc_attr($value); ?>" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        <button type="button" id="test-api-connection" class="mt-2 inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"><?php _e('تست اتصال', 'wc-ai-review-reply-pro'); ?></button>
+        <span id="test-api-result" class="mt-2 block text-sm"></span>
+        <?php
+    }
+    public function model_render() {
+        $value = isset($this->options['model']) ? $this->options['model'] : 'gpt-4o-mini';
+        ?>
+        <input type="text" name="wc_ai_review_settings[model]" value="<?php echo esc_attr($value); ?>" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        <p class="mt-2 text-sm text-gray-500"><?php _e('مدل مورد استفاده برای تولید پاسخ‌ها (مثلاً: gpt-4o-mini, deepseek-chat)', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function temperature_render() {
+        $value = isset($this->options['temperature']) ? $this->options['temperature'] : '0.7';
+        ?>
+        <input type="number" name="wc_ai_review_settings[temperature]" value="<?php echo esc_attr($value); ?>" min="0" max="1" step="0.1" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        <p class="mt-2 text-sm text-gray-500"><?php _e('میزان خلاقیت پاسخ‌ها (0 = کاملاً deterministic، 1 = بسیار خلاقانه)', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function max_tokens_render() {
+        $value = isset($this->options['max_tokens']) ? $this->options['max_tokens'] : '500';
+        ?>
+        <input type="number" name="wc_ai_review_settings[max_tokens]" value="<?php echo esc_attr($value); ?>" min="50" max="2000" step="50" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        <p class="mt-2 text-sm text-gray-500"><?php _e('حداکثر طول پاسخ تولید شده (توکن)', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function auto_reply_render() {
+        $value = isset($this->options['auto_reply']) ? $this->options['auto_reply'] : '0';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[auto_reply]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2"><?php _e('فعال کردن پاسخ خودکار به نظرات تایید شده', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <?php
+    }
+    public function preview_replies_render() {
+        $value = isset($this->options['preview_replies']) ? $this->options['preview_replies'] : '1';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[preview_replies]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2"><?php _e('نمایش پیش‌نمایش قبل از ارسال پاسخ', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <?php
+    }
+    public function reply_user_render() {
+        $value = isset($this->options['reply_user']) ? $this->options['reply_user'] : 'ai';
+        $users = get_users(array('role__in' => array('administrator', 'shop_manager')));
+        ?>
+        <select name="wc_ai_review_settings[reply_user]" id="reply_user" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <option value="ai" <?php selected($value, 'ai'); ?>><?php _e('کاربر هوش مصنوعی (🤖 هوش مصنوعی)', 'wc-ai-review-reply-pro'); ?></option>
+            <?php foreach ($users as $user): ?>
+                <option value="<?php echo $user->ID; ?>" <?php selected($value, $user->ID); ?>><?php echo $user->display_name; ?> (<?php echo $user->user_login; ?>)</option>
+            <?php endforeach; ?>
+        </select>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('کاربری که پاسخ‌ها با نام او ثبت خواهد شد.', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function custom_prompt_render() {
+        $value = isset($this->options['custom_prompt']) ? $this->options['custom_prompt'] : '';
+        ?>
+        <textarea name="wc_ai_review_settings[custom_prompt]" rows="8" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50"><?php echo esc_textarea($value); ?></textarea>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('پرامپت کامل برای مدل. از متغیرهای {product_title}, {short_description}, {attributes}, {description}, {customer_comment}, {previous_replies} استفاده کنید.', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function learn_from_previous_render() {
+        $value = isset($this->options['learn_from_previous']) ? $this->options['learn_from_previous'] : '1';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[learn_from_previous]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2"><?php _e('استفاده از پاسخ‌های قبلی برای یادگیری سبک پاسخ‌دهی', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <?php
+    }
+    public function check_scheduled_replies() {
+        $scheduled_replies = get_option('_wc_ai_review_scheduled_replies', array());
+        $current_time = current_time('mysql');
+        $updated_replies = array();
+        foreach ($scheduled_replies as $reply) {
+            if ($reply['status'] === 'pending' && $reply['scheduled_time'] <= $current_time) {
+                // تولید و ارسال پاسخ
+                $generated_reply = $this->generate_ai_reply($reply['comment_id']);
+                if (!is_wp_error($generated_reply)) {
+                    $this->post_reply($reply['comment_id'], $generated_reply);
+                    $this->add_log($reply['comment_id'], 'reply_posted_scheduled', 'پاسخ زمان‌بندی شده با موفقیت ارسال شد');
+                    // تغییر وضعیت به ارسال شده
+                    $reply['status'] = 'sent';
+                } else {
+                    $this->add_log($reply['comment_id'], 'reply_failed_scheduled', 'خطا در ارسال پاسخ زمان‌بندی شده', $generated_reply->get_error_message());
+                    // می‌توانید آن را برای تلاش مجدد زمان‌بندی کنید یا وضعیت را به 'failed' تغییر دهید
+                    $reply['status'] = 'failed';
+                }
+            }
+            // فقط پاسخ‌های در انتظار را نگه دارید
+            if ($reply['status'] === 'pending') {
+                $updated_replies[] = $reply;
+            }
+        }
+        // به‌روزرسانی لیست
+        update_option('_wc_ai_review_scheduled_replies', $updated_replies);
+    }
+    public function learn_count_render() {
+        $value = isset($this->options['learn_count']) ? $this->options['learn_count'] : '4';
+        ?>
+        <input type="number" name="wc_ai_review_settings[learn_count]" value="<?php echo esc_attr($value); ?>" min="1" max="10" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+        <p class="mt-2 text-sm text-gray-500"><?php _e('تعداد پاسخ‌های قبلی مدیر که برای یادگیری سبک استفاده می‌شوند.', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function spam_prevention_render() {
+        $value = isset($this->options['spam_prevention']) ? $this->options['spam_prevention'] : '1';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[spam_prevention]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2"><?php _e('فعال کردن تشخیص و جلوگیری از نظرات تکراری', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <?php
+    }
+    public function spam_action_render() {
+        $value = isset($this->options['spam_action']) ? $this->options['spam_action'] : 'trash';
+        ?>
+        <select name="wc_ai_review_settings[spam_action]" id="spam_action" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <option value="mark_spam" <?php selected($value, 'mark_spam'); ?>><?php _e('علامت‌گذاری به عنوان اسپم', 'wc-ai-review-reply-pro'); ?></option>
+            <option value="trash" <?php selected($value, 'trash'); ?>><?php _e('انتقال به سطل زباله', 'wc-ai-review-reply-pro'); ?></option>
+            <option value="delete" <?php selected($value, 'delete'); ?>><?php _e('حذف دائمی', 'wc-ai-review-reply-pro'); ?></option>
+            <option value="hold" <?php selected($value, 'hold'); ?>><?php _e('در انتظار بررسی', 'wc-ai-review-reply-pro'); ?></option>
+        </select>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('عملکرد در برابر نظرات تکراری', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function only_products_render() {
+        $value = isset($this->options['only_products']) ? $this->options['only_products'] : '1';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[only_products]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2"><?php _e('فعال کردن پاسخ‌دهی فقط برای محصولات ووکامرس', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <?php
+    }
+    public function excluded_categories_render() {
+        $value = isset($this->options['excluded_categories']) ? $this->options['excluded_categories'] : array();
+        $categories = get_categories(array('hide_empty' => false, 'taxonomy' => 'product_cat'));
+        ?>
+        <select name="wc_ai_review_settings[excluded_categories][]" multiple="multiple" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50" style="height: 150px;">
+            <?php foreach ($categories as $category): ?>
+                <option value="<?php echo $category->term_id; ?>" <?php selected(in_array($category->term_id, $value), true); ?>><?php echo $category->name; ?></option>
+            <?php endforeach; ?>
+        </select>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('دسته‌هایی که پاسخ هوشمند برای آن‌ها غیرفعال است', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function excluded_products_render() {
+        $value = isset($this->options['excluded_products']) ? $this->options['excluded_products'] : array();
+        $products = wc_get_products(array('limit' => -1, 'status' => 'publish'));
+        ?>
+        <select name="wc_ai_review_settings[excluded_products][]" multiple="multiple" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50" style="height: 150px;">
+            <?php foreach ($products as $product): ?>
+                <option value="<?php echo $product->get_id(); ?>" <?php selected(in_array($product->get_id(), $value), true); ?>><?php echo $product->get_name(); ?></option>
+            <?php endforeach; ?>
+        </select>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('محصولاتی که پاسخ هوشمند برای آن‌ها غیرفعال است', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function excluded_post_types_render() {
+        $value = isset($this->options['excluded_post_types']) ? $this->options['excluded_post_types'] : array();
+        $post_types = get_post_types(array('public' => true), 'objects');
+        ?>
+        <select name="wc_ai_review_settings[excluded_post_types][]" multiple="multiple" class="block w-full mt-1 rounded-md border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50" style="height: 150px;">
+            <?php foreach ($post_types as $post_type): ?>
+                <option value="<?php echo $post_type->name; ?>" <?php selected(in_array($post_type->name, $value), true); ?>><?php echo $post_type->label; ?></option>
+            <?php endforeach; ?>
+        </select>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('انواع محتوایی که پاسخ هوشمند برای آن‌ها غیرفعال است', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function debug_mode_render() {
+        $value = isset($this->options['debug_mode']) ? $this->options['debug_mode'] : '0';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[debug_mode]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2"><?php _e('فعال کردن حالت دیباگ و ذخیره لاگ', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <p class="mt-2 text-sm text-gray-500"><?php _e('در حالت دیباگ، تمامی عملیات و خطاها در پایگاه داده ذخیره می‌شوند', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function api_section_callback() {
+        echo '<p class="text-sm text-gray-600">' . __('تنظیمات اتصال به سرویس هوش مصنوعی', 'wc-ai-review-reply-pro') . '</p>';
+    }
+    public function response_section_callback() {
+        echo '<p class="text-sm text-gray-600">' . __('تنظیمات نحوه پاسخ‌دهی به نظرات', 'wc-ai-review-reply-pro') . '</p>';
+    }
+    public function spam_section_callback() {
+        echo '<p class="text-sm text-gray-600">' . __('تنظیمات مدیریت نظرات تکراری و اسپم', 'wc-ai-review-reply-pro') . '</p>';
+    }
+    public function exceptions_section_callback() {
+        echo '<p class="text-sm text-gray-600">' . __('تعیین استثناها برای پاسخ‌دهی خودکار', 'wc-ai-review-reply-pro') . '</p>';
+    }
+    public function debug_section_callback() {
+        echo '<p class="text-sm text-gray-600">' . __('تنظیمات عیب‌یابی و دیباگ پلاگین', 'wc-ai-review-reply-pro') . '</p>';
+    }
+    public function admin_dashboard() {
+        ?>
+        <div class="wc-ai-review-dashboard p-6" dir="rtl">
+            <!-- هدر اصلی -->
+            <div class="flex justify-between items-center mb-8">
+                <p class="text-3xl font-bold text-gray-800">پاسخ هوشمند به نظرات ووکامرس</p>
+                <div class="text-sm text-gray-500">
+                    <span>نسخه: 3.0.1</span>
+                </div>
+            </div>
+            <!-- راهنمای استفاده -->
+            <div class="bg-blue-50 border-r-4 border-blue-400 p-6 mb-8 rounded-lg">
+                <p class="text-xl font-bold text-blue-800 mb-4">📚 راهنمای استفاده از پلاگین</p>
+                <div class="space-y-4 text-blue-700">
+                    <p><strong>1. تنظیمات اولیه:</strong> ابتدا به بخش <strong>تنظیمات</strong> بروید و کلید API خود را وارد کنید. می‌توانید از سرویس‌های OneAPI، OpenAI یا DeepSeek استفاده کنید.</p>
+                    <p><strong>2. پاسخ خودکار:</strong> با فعال کردن گزینه <strong>"پاسخ خودکار"</strong>، پلاگین به صورت خودکار به نظرات تایید شده پاسخ می‌دهد.</p>
+                    <p><strong>3. پیش‌نمایش پاسخ:</strong> اگر گزینه <strong>"پیش‌نمایش پاسخ‌ها"</strong> فعال باشد، قبل از ارسال نهایی، پاسخ تولید شده را مشاهده و تایید می‌کنید.</p>
+                    <p><strong>4. مدیریت نظرات:</strong> در صفحه اصلی <strong>مدیریت نظرات</strong> وردپرس، می‌توانید به صورت دستی برای هر نظر، پاسخ هوشمند تولید کنید.</p>
+                    <p><strong>5. پاسخ دستی در متا باکس:</strong> هنگام ویرایش یک نظر، در بخش متا باکس پایین صفحه، دکمه <strong>"تولید پاسخ هوشمند"</strong> وجود دارد. با کلیک بر آن، پاسخ پیشنهادی نمایش داده می‌شود و می‌توانید آن را ارسال کنید.</p>
+                    <p><strong>6. استثناها:</strong> می‌توانید برای محصولات، دسته‌ها یا انواع محتوا، پاسخ هوشمند را غیرفعال کنید.</p>
+                    <p><strong>7. پاسخ‌های از پیش تعریف شده:</strong> برای سوالات متداول، پاسخ‌های استاندارد تعریف کنید تا پلاگین به جای تولید هوش مصنوعی، از آن‌ها استفاده کند.</p>
+                    <p><strong>8. دیباگ:</strong> در صورت بروز مشکل، می‌توانید حالت دیباگ را فعال کرده و لاگ‌های سیستم را بررسی کنید.</p>
+                    <p>  برای تهیه توکن از one api به وبسایت  مراجعه کنید one-api.ir</p>
+                </div>
+            </div>
+            <!-- بخش تحلیل هوشمند -->
+            <div class="bg-white shadow-sm rounded-lg p-6 mb-8">
+                <p class="text-xl font-semibold mb-4 text-gray-700">تحلیل و بررسی هوشمند نظرات</p>
+                <p class="text-gray-600 mb-6">
+                    با استفاده از این بخش می‌توانید آمار کلی از روند نظرات در سایت خود را دریافت کنید.
+                    <br>
+                    <strong class="text-red-600">⚠️ توجه:</strong> این تحلیل توسط هوش مصنوعی انجام می‌شود و ممکن است هزینه API بیشتری داشته باشد.
+                </p>
+                <!-- نمودار میله‌ای آمار کلی -->
+                <div class="bg-gray-50 p-4 rounded-lg mb-6">
+                    <p class="text-md font-medium text-gray-700 mb-4">نمودار آمار کلی نظرات</p>
+                    <canvas id="comments-chart" class="w-full h-64"></canvas>
+                </div>
+                <!-- فرم تعاملی -->
+                <div class="bg-gray-50 p-6 rounded-lg mb-6">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">تعداد نظرات برای تحلیل</label>
+                            <select id="analysis-count" class="block w-full p-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500">
+                                <option value="10">۱۰ نظر آخر</option>
+                                <option value="25" selected>۲۵ نظر آخر</option>
+                                <option value="50">۵۰ نظر آخر</option>
+                                <option value="100">۱۰۰ نظر آخر</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">بازه زمانی</label>
+                            <select id="analysis-period" class="block w-full p-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500">
+                                <option value="7">۷ روز گذشته</option>
+                                <option value="30" selected>۳۰ روز گذشته</option>
+                                <option value="90">۹۰ روز گذشته</option>
+                                <option value="all">همه نظرات</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">نوع نظرات</label>
+                            <select id="analysis-type" class="block w-full p-2 border border-gray-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500">
+                                <option value="all" selected>همه نظرات</option>
+                                <option value="review">فقط بررسی محصولات</option>
+                                <option value="comment">فقط نظرات مطالب</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button type="button" id="start-analysis" class="w-full md:w-auto px-6 py-3 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors duration-200">
+                        شروع تحلیل هوشمند
+                    </button>
+                </div>
+                <!-- نتایج تحلیل -->
+                <div id="analysis-results" class="hidden">
+                    <div class="flex justify-between items-center mb-4">
+                        <p class="text-md font-medium text-gray-700">نتایج تحلیل</p>
+                        <button type="button" id="download-analysis-pdf" class="px-3 py-1 bg-gray-200 text-gray-800 text-xs font-medium rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500">
+                            دانلود PDF
+                        </button>
+                    </div>
+                    <div id="analysis-content" class="bg-gray-50 p-4 rounded-lg prose max-w-none"></div>
+                </div>
+                <!-- وضعیت در حال پردازش -->
+                <div id="analysis-status" class="hidden mt-4 p-4 bg-blue-50 border border-blue-200 rounded-md">
+                    <div class="flex items-center">
+                        <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12pzm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <span class="text-sm text-blue-700">در حال تحلیل نظرات توسط هوش مصنوعی... لطفاً صبر کنید.</span>
+                    </div>
+                </div>
+            </div>
+            <div class="bg-white shadow-sm rounded-lg p-6 mb-8">
+                <?php $this->tasks_page() ?>
+            </div>
+            <!-- بخش راهنمای سریع و آمار -->
+            <div class="bg-white shadow-sm rounded-lg p-6 mb-8">
+                <p class="text-xl font-semibold mb-4 text-gray-700">راهنمای سریع</p>
+                <p class="text-gray-600 mb-6">به پنل مدیریت پاسخ هوشمند خوش آمدید. از اینجا می‌توانید تمامی جنبه‌های پلاگین را مدیریت کنید.</p>
+                <div id="dashboard-stats" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-sm font-medium text-gray-500">نظرات کل</p>
+                        <div class="text-2xl font-bold text-gray-900 mt-1" id="stat-total-comments">--</div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-sm font-medium text-gray-500">بررسی‌های محصول</p>
+                        <div class="text-2xl font-bold text-gray-900 mt-1" id="stat-total-reviews">--</div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-sm font-medium text-gray-500">پاسخ‌های هوشمند</p>
+                        <div class="text-2xl font-bold text-gray-900 mt-1" id="stat-ai-replies">--</div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-sm font-medium text-gray-500">در انتظار تایید</p>
+                        <div class="text-2xl font-bold text-gray-900 mt-1" id="stat-pending-comments">--</div>
+                    </div>
+                    <div class="bg-gray-50 rounded-lg p-4 text-center">
+                        <p class="text-sm font-medium text-gray-500">۷ روز گذشته</p>
+                        <div class="text-2xl font-bold text-gray-900 mt-1" id="stat-last-7-days">--</div>
+                    </div>
+                </div>
+                <button type="button" id="refresh-dashboard-stats" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                    بروزرسانی آمار
+                </button>
+            </div>
+            <!-- بخش عملیات سریع و وضعیت سیستم -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <!-- ستون 1: عملیات سریع -->
+                <div class="bg-white shadow-sm rounded-lg p-6">
+                    <p class="text-xl font-semibold mb-4 text-gray-700">عملیات سریع</p>
+                    <div class="space-y-3">
+                        <a href="<?php echo admin_url('edit-comments.php'); ?>" class="block w-full text-center px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors duration-200">
+                            مدیریت نظرات
+                        </a>
+                        <a href="<?php echo admin_url('admin.php?page=wc-ai-review-settings'); ?>" class="block w-full text-center px-4 py-2 bg-gray-200 text-gray-800 text-sm font-medium rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500 transition-colors duration-200">
+                            تنظیمات پلاگین
+                        </a>
+                        <a href="<?php echo admin_url('admin.php?page=wc-ai-review-debug'); ?>" class="block w-full text-center px-4 py-2 bg-gray-200 text-gray-800 text-sm font-medium rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500 transition-colors duration-200">
+                            ابزارهای دیباگ
+                        </a>
+                        <a href="<?php echo admin_url('admin.php?page=wc-ai-review-tasks'); ?>" class="block w-full text-center px-4 py-2 bg-gray-200 text-gray-800 text-sm font-medium rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500 transition-colors duration-200">
+                            وظایف
+                        </a>
+                    </div>
+                </div>
+                <!-- ستون 2: وضعیت سیستم -->
+                <div class="bg-white shadow-sm rounded-lg p-6">
+                    <p class="text-xl font-semibold mb-4 text-gray-700">وضعیت سیستم</p>
+                    <ul class="space-y-4">
+                        <li class="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
+                            <span class="text-gray-600 font-medium">ووکامرس:</span>
+                            <span class="px-3 py-1 text-xs font-semibold rounded-full <?php echo class_exists('WooCommerce') ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'; ?>">
+                                <?php echo class_exists('WooCommerce') ? 'فعال' : 'غیرفعال'; ?>
+                            </span>
+                        </li>
+                        <li class="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
+                            <span class="text-gray-600 font-medium">کلید API:</span>
+                            <span class="px-3 py-1 text-xs font-semibold rounded-full <?php echo !empty($this->options['api_key']) ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'; ?>">
+                                <?php echo !empty($this->options['api_key']) ? 'تنظیم شده' : 'تنظیم نشده'; ?>
+                            </span>
+                        </li>
+                        <li class="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
+                            <span class="text-gray-600 font-medium">کاربر هوش مصنوعی:</span>
+                            <span class="px-3 py-1 text-xs font-semibold rounded-full <?php echo $this->ai_user_id && get_user_by('id', $this->ai_user_id) ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'; ?>">
+                                <?php echo $this->ai_user_id && get_user_by('id', $this->ai_user_id) ? 'فعال' : 'غیرفعال'; ?>
+                            </span>
+                        </li>
+                        <li class="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
+                            <span class="text-gray-600 font-medium">پاسخ خودکار:</span>
+                            <span class="px-3 py-1 text-xs font-semibold rounded-full <?php echo isset($this->options['auto_reply']) && $this->options['auto_reply'] === '1' ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'; ?>">
+                                <?php echo isset($this->options['auto_reply']) && $this->options['auto_reply'] === '1' ? 'فعال' : 'غیرفعال'; ?>
+                            </span>
+                        </li>
+                    </ul>
+                </div>
+                <!-- ستون 3: آخرین نظرات -->
+                <div class="bg-white shadow-sm rounded-lg p-6">
+                    <p class="text-xl font-semibold mb-4 text-gray-700">آخرین نظرات</p>
+                    <p class="text-gray-600 mb-4">آخرین نظرات ثبت شده در وبسایتتان را بررسی کنید.</p>
+                    <div class="space-y-3 max-h-80 overflow-y-auto">
+                        <?php
+                        $recent_comments = get_comments(array(
+                            'status' => 'approve',
+                            'number' => 5,
+                            'orderby' => 'comment_date',
+                            'order' => 'DESC'
+                        ));
+                        if (empty($recent_comments)) {
+                            echo '<p class="text-gray-500 text-center py-4">هیچ نظری یافت نشد.</p>';
+                        } else {
+                            foreach ($recent_comments as $comment) {
+                                $post = get_post($comment->comment_post_ID);
+                                ?>
+                                <div class="p-3 bg-gray-50 rounded-md border border-gray-200">
+                                    <div class="flex justify-between items-start">
+                                        <div class="text-sm">
+                                            <strong class="text-gray-800"><?php echo esc_html($comment->comment_author); ?></strong>
+                                            <span class="text-gray-500"> در </span>
+                                            <span class="text-gray-500 text-xs"><?php echo date('Y-m-d H:i', strtotime($comment->comment_date)); ?></span>
+                                        </div>
+                                        <a href="<?php echo get_comment_link($comment->comment_ID); ?>" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-xs">مشاهده</a>
+                                    </div>
+                                    <p class="text-sm text-gray-700 mt-2 line-clamp-2"><?php echo wp_trim_words($comment->comment_content, 15); ?></p>
+                                    <?php if ($post): ?>
+                                        <p class="text-xs text-gray-500 mt-1">برای: <a href="<?php echo get_permalink($post->ID); ?>" target="_blank" class="text-indigo-600 hover:underline"><?php echo esc_html($post->post_title); ?></a></p>
+                                    <?php endif; ?>
+                                </div>
+                                <?php
+                            }
+                        }
+                        ?>
+                    </div>
+                    <a href="<?php echo admin_url('edit-comments.php'); ?>" class="block w-full text-center mt-4 px-4 py-2 bg-gray-200 text-gray-800 text-sm font-medium rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500 transition-colors duration-200">
+                        مشاهده همه نظرات
+                    </a>
+                </div>
+            </div>
+        </div>
+        <!-- Chart.js Library -->
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+            jQuery(document).ready(function($) {
+                // بارگذاری نمودار آمار
+                const ctx = document.getElementById('comments-chart').getContext('2d');
+                const commentsChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: ['نظرات کل', 'بررسی‌ها', 'پاسخ‌های هوشمند', 'در انتظار', '۷ روز گذشته'],
+                        datasets: [{
+                            label: 'تعداد نظرات',
+                            data: [0, 0, 0, 0, 0],
+                            backgroundColor: [
+                                'rgba(59, 130, 246, 0.5)',
+                                'rgba(16, 185, 129, 0.5)',
+                                'rgba(245, 158, 11, 0.5)',
+                                'rgba(239, 68, 68, 0.5)',
+                                'rgba(139, 92, 246, 0.5)'
+                            ],
+                            borderColor: [
+                                'rgba(59, 130, 246, 1)',
+                                'rgba(16, 185, 129, 1)',
+                                'rgba(245, 158, 11, 1)',
+                                'rgba(239, 68, 68, 1)',
+                                'rgba(139, 92, 246, 1)'
+                            ],
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    stepSize: 1
+                                }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                display: false
+                            }
+                        }
+                    }
+                });
+                // بروزرسانی آمار داشبورد
+                function refreshDashboardStats() {
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'get_comment_stats',
+                            nonce: wc_ai_review.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $('#stat-total-comments').text(response.data.total_comments);
+                                $('#stat-total-reviews').text(response.data.total_reviews);
+                                $('#stat-ai-replies').text(response.data.ai_replies);
+                                $('#stat-pending-comments').text(response.data.pending_comments);
+                                $('#stat-last-7-days').text(response.data.last_7_days);
+                                // بروزرسانی داده‌های نمودار
+                                commentsChart.data.datasets[0].data = [
+                                    response.data.total_comments,
+                                    response.data.total_reviews,
+                                    response.data.ai_replies,
+                                    response.data.pending_comments,
+                                    response.data.last_7_days
+                                ];
+                                commentsChart.update();
+                            }
+                        }
+                    });
+                }
+                // شروع تحلیل هوشمند
+                $('#start-analysis').on('click', function() {
+                    if (!confirm('آیا مطمئن هستید؟ این عملیات ممکن است هزینه API بالایی داشته باشد.')) {
+                        return;
+                    }
+                    var $button = $(this);
+                    var $status = $('#analysis-status');
+                    var $results = $('#analysis-results');
+                    var $content = $('#analysis-content');
+                    $button.prop('disabled', true);
+                    $status.removeClass('hidden');
+                    $results.addClass('hidden');
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'generate_ai_analysis',
+                            count: $('#analysis-count').val(),
+                            period: $('#analysis-period').val(),
+                            type: $('#analysis-type').val(),
+                            nonce: wc_ai_review.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $content.html(response.data.html);
+                                $results.removeClass('hidden');
+                            } else {
+                                alert('خطا: ' + response.data);
+                            }
+                        },
+                        error: function() {
+                            alert('خطا در ارتباط با سرور');
+                        },
+                        complete: function() {
+                            $button.prop('disabled', false);
+                            $status.addClass('hidden');
+                        }
+                    });
+                });
+                // دانلود PDF
+                $(document).on('click', '#download-analysis-pdf', function() {
+                    var analysisHtml = $('#analysis-content').html();
+                    if (!analysisHtml) {
+                        alert('هیچ تحلیلی برای دانلود وجود ندارد.');
+                        return;
+                    }
+                    window.open('<?php echo admin_url('admin-ajax.php'); ?>?action=download_analysis_pdf&html=' + encodeURIComponent(analysisHtml) + '&nonce=<?php echo wp_create_nonce('wc_ai_review_nonce'); ?>', '_blank');
+                });
+                // رویدادهای کلیک
+                $('#refresh-dashboard-stats').on('click', refreshDashboardStats);
+                // بارگذاری اولیه آمار
+                refreshDashboardStats();
+            });
+        </script>
+        <?php
+    }
+    public function settings_page() {
+        ?>
+        <div class="wc-ai-review-settings p-6" dir="rtl">
+            <div class="flex justify-between items-center mb-6">
+                <span class="text-xl font-bold">تنظیمات پاسخ هوشمند به نظرات</span>
+            </div>
+            <div class="bg-white shadow rounded-lg p-6 mb-6">
+                <span class="block text-lg font-medium mb-4">پیش‌نمایش زنده</span>
+                <p class="text-sm text-gray-600 mb-4">یک نظر نمونه وارد کنید تا پاسخ پیشنهادی هوش مصنوعی را ببینید.</p>
+                <textarea id="live-preview-input" rows="4" class="block w-full p-3 mb-4 border border-gray-300 rounded-md" placeholder="نظر نمونه مشتری را اینجا وارد کنید..."></textarea>
+                <button type="button" id="generate-live-preview" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700">تولید پیش‌نمایش</button>
+                <div id="live-preview-output" class="mt-4 p-4 bg-gray-50 rounded-md hidden"></div>
+            </div>
+            <form action="options.php" method="post" class="bg-white shadow rounded-lg p-6">
+                <?php
+                settings_fields('wc_ai_review');
+                do_settings_sections('wc_ai_review');
+                submit_button('ذخیره تنظیمات', 'primary', 'submit', true, array('class' => 'px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700'));
+                ?>
+            </form>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                $('#generate-live-preview').on('click', function() {
+                    var $button = $(this);
+                    var $output = $('#live-preview-output');
+                    var sample_comment = $('#live-preview-input').val();
+                    if (!sample_comment) {
+                        alert('لطفاً یک نظر نمونه وارد کنید.');
+                        return;
+                    }
+                    $button.prop('disabled', true).text('در حال تولید...');
+                    $output.html('').addClass('hidden');
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'generate_live_preview',
+                            sample_comment: sample_comment,
+                            nonce: wc_ai_review.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $output.html('<strong>پاسخ پیشنهادی:</strong><br>' + response.data.reply).removeClass('hidden');
+                            } else {
+                                $output.html('<span class="text-red-600">خطا: ' + response.data + '</span>').removeClass('hidden');
+                            }
+                        },
+                        error: function() {
+                            $output.html('<span class="text-red-600">خطا در ارتباط با سرور</span>').removeClass('hidden');
+                        },
+                        complete: function() {
+                            $button.prop('disabled', false).text('تولید پیش‌نمایش');
+                        }
+                    });
+                });
+            });
+        </script>
+        <?php
+    }
+    public function debug_page() {
+        ?>
+        <div class="wc-ai-review-debug" dir="rtl">
+            <div class="flex justify-between items-center mb-8">
+                <p class="text-2xl font-bold text-gray-800">ابزارهای دیباگ و عیب‌یابی</p>
+            </div>
+            <div class="bg-white shadow-sm rounded-lg p-6 mb-8">
+                <p class="text-lg font-semibold mb-4 text-gray-700">عملیات دیباگ</p>
+                <div class="space-y-4">
+                    <div>
+                        <button type="button" class="debug-action px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500" data-action="clear_logs">
+                            پاک کردن لاگ‌ها
+                        </button>
+                    </div>
+                    <div>
+                        <button type="button" class="debug-action px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500" data-action="test_email">
+                            تست ارسال ایمیل
+                        </button>
+                    </div>
+                    <div>
+                        <button type="button" class="debug-action px-4 py-2 bg-yellow-600 text-white text-sm font-medium rounded-md hover:bg-yellow-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-500" data-action="check_db">
+                            بررسی پایگاه داده
+                        </button>
+                    </div>
+                    <div>
+                        <button type="button" class="debug-action px-4 py-2 bg-purple-600 text-white text-sm font-medium rounded-md hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500" data-action="rebuild_tables">
+                            بازسازی جداول دیتابیس
+                        </button>
+                    </div>
+                </div>
+                <div id="debug-result" class="mt-6"></div>
+            </div>
+            <div class="bg-white shadow-sm rounded-lg p-6">
+                <p class="text-lg font-semibold mb-4 text-gray-700">لاگ‌های سیستم</p>
+                <?php if (isset($this->options['debug_mode']) && $this->options['debug_mode'] === '1'): ?>
+                    <?php
+                    global $wpdb;
+                    $table_name = $wpdb->prefix . 'wc_ai_review_logs';
+                    $logs = $wpdb->get_results("SELECT * FROM $table_name ORDER BY time DESC LIMIT 100");
+                    ?>
+                    <?php if ($logs): ?>
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full divide-y divide-gray-200">
+                                <thead class="bg-gray-50">
+                                <tr>
+                                    <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">زمان</th>
+                                    <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">نظر</th>
+                                    <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">عمل</th>
+                                    <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">پیام</th>
+                                </tr>
+                                </thead>
+                                <tbody class="bg-white divide-y divide-gray-200">
+                                <?php foreach ($logs as $log): ?>
+                                    <tr>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500"><?php echo date('Y-m-d H:i:s', strtotime($log->time)); ?></td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900"><?php echo $log->comment_id; ?></td>
+                                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900"><?php echo $log->action; ?></td>
+                                        <td class="px-6 py-4 text-sm text-gray-500"><?php echo $log->message; ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    <?php else: ?>
+                        <p class="text-gray-500">هیچ لاگی ثبت نشده است.</p>
+                    <?php endif; ?>
+                <?php else: ?>
+                    <div class="bg-yellow-50 border border-yellow-200 text-yellow-700 px-4 py-3 rounded-md">
+                        <p>حالت دیباگ غیرفعال است. برای ذخیره لاگ‌ها، لطفاً حالت دیباگ را از تنظیمات فعال کنید.</p>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </div>
+        <?php
+    }
+    public function generate_live_preview_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        $sample_comment = isset($_POST['sample_comment']) ? sanitize_textarea_field($_POST['sample_comment']) : '';
+        if (empty($sample_comment)) {
+            wp_send_json_error('نظر نمونه خالی است.');
+        }
+        // ایجاد یک پاسخ شبیه‌سازی شده
+        $fake_product_info = array(
+            'title' => 'محصول نمونه',
+            'short_description' => 'توضیحات کوتاه محصول نمونه',
+            'attributes' => 'رنگ: قرمز, سایز: M',
+            'description' => 'توضیحات کامل محصول نمونه برای تست پیش‌نمایش زنده.'
+        );
+        $prompt = $this->build_prompt($fake_product_info, $sample_comment, array());
+        $response = $this->call_ai_api($prompt);
+        if (is_wp_error($response)) {
+            wp_send_json_error($response->get_error_message());
+        }
+        wp_send_json_success(array('reply' => $response));
+    }
+    public function handle_comment_submission($comment_id, $comment_approved, $commentdata) {
+        $this->add_log($comment_id, 'comment_submitted', 'نظر جدید ارسال شد', $commentdata);
+        // بررسی تکراری نبودن نظر
+        if ($this->is_duplicate_comment($commentdata)) {
+            $this->handle_duplicate_comment($comment_id, $commentdata);
+            return;
+        }
+        // فقط اگر نظر بلافاصله تایید شده باشد، پاسخ دهیم
+        // اگر تایید نشده باشد، هوک `comment_unapproved_to_approved` مراقبت می‌کند.
+        if ($comment_approved === 1 && $this->is_auto_reply_enabled()) {
+            $this->generate_and_post_reply($comment_id);
+        }
+    }
+    public function forbidden_response_render() {
+        $value = isset($this->options['forbidden_response']) ? $this->options['forbidden_response'] : 'با سلام و احترام، متاسفانه نظر شما حاوی محتوای نامناسب بود و نمی‌تواند منتشر شود. لطفاً از به کار بردن زبان نامناسب خودداری فرمایید. با تشکر از همراهی شما.';
+        ?>
+        <textarea name="wc_ai_review_settings[forbidden_response]" rows="5" class="large-text" placeholder="متن پیش‌فرض برای کاربرانی که از کلمات ممنوعه استفاده می‌کنند"><?php echo esc_textarea($value); ?></textarea>
+        <p class="description">این متن برای کاربرانی که در نظرشان از کلمات ممنوعه استفاده کرده‌اند، نمایش داده می‌شود.</p>
+        <?php
+    }
+    public function handle_comment_status_change($comment_id, $comment_status) {
+        if ($comment_status === 'approve' && $this->is_auto_reply_enabled()) {
+            $this->generate_and_post_reply($comment_id);
+        }
+    }
+    public function maybe_auto_reply_on_approval($comment) {
+        // فقط اگر قبلاً پاسخی ارسال نشده باشد، پاسخ جدید تولید کنیم
+        if ($this->is_auto_reply_enabled() && !$this->has_already_replied($comment->comment_ID)) {
+            $this->generate_and_post_reply($comment->comment_ID);
+        }
+    }
+    private function check_for_canned_response($customer_comment) {
+        $canned_responses = isset($this->options['canned_responses']) ? $this->options['canned_responses'] : array();
+        foreach ($canned_responses as $item) {
+            if (empty($item['trigger']) || empty($item['response'])) {
+                continue;
+            }
+            // جستجوی کلمه کلیدی در نظر (غیرحساس به بزرگی و کوچکی حروف)
+            if (stripos($customer_comment, $item['trigger']) !== false) {
+                return $item['response'];
+            }
+        }
+        return false; // پاسخ از پیش تعریف شده پیدا نشد
+    }
+    private function is_auto_reply_enabled() {
+        return isset($this->options['auto_reply']) && $this->options['auto_reply'] === '1';
+    }
+    private function should_preview_replies() {
+        return isset($this->options['preview_replies']) && $this->options['preview_replies'] === '1';
+    }
+    public function prevent_duplicate_comments($approved, $commentdata) {
+        if (!isset($this->options['spam_prevention']) || $this->options['spam_prevention'] !== '1') {
+            return $approved;
+        }
+        if ($this->is_duplicate_comment($commentdata)) {
+            $this->add_log(0, 'duplicate_prevented', 'نظر تکراری شناسایی و مسدود شد', $commentdata);
+            $action = isset($this->options['spam_action']) ? $this->options['spam_action'] : 'trash';
+            if ($action === 'delete') {
+                wp_die(__('نظر شما به دلیل تکراری بودن حذف شد.', 'wc-ai-review-reply-pro'));
+            } else {
+                if ($action === 'mark_spam') return 'spam';
+                if ($action === 'trash') return 'trash';
+                if ($action === 'hold') return '0';
+            }
+        }
+        return $approved;
+    }
+    private function is_duplicate_comment($commentdata) {
+        global $wpdb;
+        $duplicate = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $wpdb->comments 
+            WHERE comment_author = %s 
+            AND comment_author_email = %s 
+            AND comment_content = %s 
+            AND comment_date >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+            AND comment_approved != 'trash'",
+            $commentdata['comment_author'],
+            $commentdata['comment_author_email'],
+            $commentdata['comment_content']
+        ));
+        return $duplicate > 0;
+    }
+    private function handle_duplicate_comment($comment_id, $commentdata) {
+        $action = isset($this->options['spam_action']) ? $this->options['spam_action'] : 'trash';
+        switch ($action) {
+            case 'delete':
+                wp_delete_comment($comment_id, true);
+                break;
+            case 'trash':
+                wp_trash_comment($comment_id);
+                break;
+            case 'mark_spam':
+                wp_set_comment_status($comment_id, 'spam');
+                break;
+            case 'hold':
+                wp_set_comment_status($comment_id, 'hold');
+                break;
+        }
+        $this->add_log($comment_id, 'duplicate_handled', 'نظر تکراری مدیریت شد: ' . $action, $commentdata);
+    }
+    public function generate_ai_reply_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('moderate_comments')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        $comment_id = isset($_POST['comment_id']) ? intval($_POST['comment_id']) : 0;
+        $post_reply = isset($_POST['post_reply']) ? $_POST['post_reply'] === 'true' : false;
+        if (!$comment_id) {
+            wp_send_json_error(__('شناسه نظر نامعتبر است', 'wc-ai-review-reply-pro'));
+        }
+        $reply = $this->generate_ai_reply($comment_id);
+        if (is_wp_error($reply)) {
+            wp_send_json_error($reply->get_error_message());
+        }
+        // اگر کاربر فقط می‌خواهد پیش‌نمایش ببیند
+        if (!$post_reply) {
+            wp_send_json_success(array(
+                'reply' => $reply,
+                'preview' => true
+            ));
+        }
+        // اگر کاربر می‌خواهد پاسخ ارسال شود
+        $result = $this->post_reply($comment_id, $reply);
+        if (is_wp_error($result)) {
+            wp_send_json_error($result->get_error_message());
+        }
+        wp_send_json_success(array(
+            'message' => __('پاسخ با موفقیت ارسال شد', 'wc-ai-review-reply-pro'),
+            'preview' => false
+        ));
+    }
+    public function test_ai_connection_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        $test_prompt = "سلام! این یک تست است. لطفاً با 'اتصال موفق' پاسخ دهید.";
+        $response = $this->call_ai_api($test_prompt);
+        if (is_wp_error($response)) {
+            wp_send_json_error($response->get_error_message());
+        }
+        wp_send_json_success(array(
+            'message' => __('اتصال موفقیت‌آمیز بود', 'wc-ai-review-reply-pro'),
+            'response' => $response
+        ));
+    }
+    public function debug_plugin_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        $action = isset($_POST['debug_action']) ? $_POST['debug_action'] : '';
+        switch ($action) {
+            case 'clear_logs':
+                $this->clear_logs();
+                wp_send_json_success(__('لاگ‌ها با موفقیت پاک شدند', 'wc-ai-review-reply-pro'));
+                break;
+            case 'test_email':
+                $email = get_option('admin_email');
+                $subject = 'تست ایمیل از پلاگین پاسخ هوشمند';
+                $message = 'این یک ایمیل تستی است تا از صحت ارسال ایمیل اطمینان حاصل شود.';
+                if (wp_mail($email, $subject, $message)) {
+                    wp_send_json_success(__('ایمیل تست با موفقیت ارسال شد', 'wc-ai-review-reply-pro'));
+                } else {
+                    wp_send_json_error(__('ارسال ایمیل ناموفق بود', 'wc-ai-review-reply-pro'));
+                }
+                break;
+            case 'check_db':
+                global $wpdb;
+                $table_name = $wpdb->prefix . 'wc_ai_review_logs';
+                if ($wpdb->get_var("SHOW TABLES LIKE '$table_name'") != $table_name) {
+                    wp_send_json_error(__('جدول لاگ‌ها وجود ندارد', 'wc-ai-review-reply-pro'));
+                } else {
+                    $count = $wpdb->get_var("SELECT COUNT(*) FROM $table_name");
+                    wp_send_json_success(sprintf(__('جدول لاگ‌ها وجود دارد و شامل %d رکورد است', 'wc-ai-review-reply-pro'), $count));
+                }
+                break;
+            case 'rebuild_tables':
+                $this->create_log_table();
+                wp_send_json_success(__('جدول‌های دیتابیس با موفقیت بازسازی شدند', 'wc-ai-review-reply-pro'));
+                break;
+            default:
+                wp_send_json_error(__('عملکرد دیباگ نامعتبر است', 'wc-ai-review-reply-pro'));
+        }
+    }
+    public function get_comment_stats_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('moderate_comments')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        global $wpdb;
+        $stats = array(
+            'total_comments' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->comments WHERE comment_type = '' OR comment_type = 'comment'"),
+            'total_reviews' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->comments WHERE comment_type = 'review'"),
+            'ai_replies' => (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $wpdb->comments WHERE comment_author LIKE %s",
+                '%هوش مصنوعی%'
+            )),
+            'pending_comments' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->comments WHERE comment_approved = '0'"),
+            'last_7_days' => (int) $wpdb->get_var("SELECT COUNT(*) FROM $wpdb->comments WHERE comment_date >= DATE_SUB(NOW(), INTERVAL 7 DAY)")
+        );
+        wp_send_json_success($stats);
+    }
+    public function toggle_comment_exception_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('moderate_comments')) {
+            wp_die(__('دسترسی غیرمجاز', 'wc-ai-review-reply-pro'));
+        }
+        $comment_id = isset($_POST['comment_id']) ? intval($_POST['comment_id']) : 0;
+        if (!$comment_id) {
+            wp_send_json_error(__('شناسه نظر نامعتبر است', 'wc-ai-review-reply-pro'));
+        }
+        $comment = get_comment($comment_id);
+        if (!$comment) {
+            wp_send_json_error(__('نظر یافت نشد', 'wc-ai-review-reply-pro'));
+        }
+        $post_id = $comment->comment_post_ID;
+        $excluded_posts = get_option('_wc_ai_review_excluded_posts', array());
+        if (in_array($post_id, $excluded_posts)) {
+            $excluded_posts = array_diff($excluded_posts, array($post_id));
+            $message = 'مطلب از لیست استثناها حذف شد.';
+        } else {
+            $excluded_posts[] = $post_id;
+            $message = 'مطلب به لیست استثناها اضافه شد.';
+        }
+        update_option('_wc_ai_review_excluded_posts', array_values($excluded_posts));
+        wp_send_json_success(array('message' => $message));
+    }
+    private function clear_logs() {
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'wc_ai_review_logs';
+        $wpdb->query("TRUNCATE TABLE $table_name");
+    }
+    private function has_already_replied($comment_id) {
+        // جستجوی پاسخ‌هایی که والد این نظر هستند و توسط کاربر هوش مصنوعی یا کاربر تعیین شده ارسال شده‌اند.
+        $replies = get_comments(array(
+            'parent' => $comment_id,
+            'status' => 'approve',
+            'type' => 'comment',
+            'number' => 1, // فقط یک مورد کافی است
+            'orderby' => 'comment_date',
+            'order' => 'DESC'
+        ));
+        foreach ($replies as $reply) {
+            // بررسی اینکه آیا پاسخ توسط کاربر هوش مصنوعی یا کاربر تعیین شده در تنظیمات ارسال شده است
+            $reply_user = isset($this->options['reply_user']) ? $this->options['reply_user'] : 'ai';
+            if ($reply_user === 'ai') {
+                if ($reply->user_id === $this->ai_user_id) {
+                    return true; // قبلاً پاسخ داده شده است
+                }
+            } else {
+                if ($reply->user_id == $reply_user) {
+                    return true; // قبلاً پاسخ داده شده است
+                }
+            }
+        }
+        return false; // هنوز پاسخی ارسال نشده است
+    }
+    private function generate_and_post_reply($comment_id) {
+        // لایه 1: بررسی Transient (جلوگیری از پاسخ تکراری در بازه زمانی کوتاه)
+        $transient_key = $this->transient_prefix . $comment_id;
+        if (get_transient($transient_key)) {
+            $this->add_log($comment_id, 'duplicate_attempt', 'پاسخ تکراری: transient فعال است');
+            return;
+        }
+        // لایه 2: بررسی اینکه آیا قبلاً به این نظر پاسخ داده‌ایم یا خیر
+        if ($this->has_already_replied($comment_id)) {
+            $this->add_log($comment_id, 'duplicate_attempt', 'پاسخ تکراری: قبلاً پاسخ داده شده است');
+            return;
+        }
+        // لایه 3: بررسی استثناها
+        if ($this->is_excluded($comment_id)) {
+            $this->add_log($comment_id, 'excluded', 'نظر در لیست استثناها قرار دارد');
+            return;
+        }
+        // تعیین زمان ارسال بر اساس قوانین
+        $scheduled_time = $this->calculate_scheduled_time($comment_id);
+        if ($scheduled_time === null) {
+            $this->add_log($comment_id, 'scheduling_failed', 'محاسبه زمان ارسال با خطا مواجه شد');
+            return;
+        }
+        // ذخیره پاسخ برای ارسال آینده
+        $this->schedule_reply($comment_id, $scheduled_time);
+        $this->add_log($comment_id, 'reply_scheduled', 'پاسخ برای ارسال در زمان مشخص زمان‌بندی شد', array('scheduled_time' => $scheduled_time));
+        // تنظیم transient برای جلوگیری از پردازش مجدد در بازه کوتاه
+        set_transient($transient_key, true, 5 * MINUTE_IN_SECONDS); // 5 دقیقه کافی است
+    }
+    private function calculate_scheduled_time($comment_id) {
+        $comment = get_comment($comment_id);
+        $current_time = current_time('timestamp');
+        $default_delay = isset($this->options['default_delay']) ? intval($this->options['default_delay']) : 60;
+        $scheduled_time = $current_time + ($default_delay * 60); // تبدیل دقیقه به ثانیه
+        // بررسی قوانین شرطی
+        $scheduling_rules = isset($this->options['scheduling_rules']) ? $this->options['scheduling_rules'] : array();
+        foreach ($scheduling_rules as $rule) {
+            $keywords = isset($rule['keywords']) ? explode(',', $rule['keywords']) : array();
+            $delay = isset($rule['delay']) ? intval($rule['delay']) : 0;
+            $time_range = isset($rule['time_range']) ? $rule['time_range'] : '';
+            // بررسی وجود کلمات کلیدی در نظر
+            $match_found = false;
+            foreach ($keywords as $keyword) {
+                $keyword = trim($keyword);
+                if (!empty($keyword) && stripos($comment->comment_content, $keyword) !== false) {
+                    $match_found = true;
+                    break;
+                }
+            }
+            if ($match_found) {
+                $rule_time = $current_time + ($delay * 60);
+                // اگر بازه زمانی تعریف شده باشد، بررسی کنید
+                if (!empty($time_range) && strpos($time_range, '-') !== false) {
+                    list($start_time, $end_time) = explode('-', $time_range);
+                    $start_timestamp = strtotime(date('Y-m-d') . ' ' . trim($start_time));
+                    $end_timestamp = strtotime(date('Y-m-d') . ' ' . trim($end_time));
+                    // اگر زمان محاسبه شده خارج از بازه است، آن را به ابتدای بازه بعدی منتقل کنید
+                    if ($rule_time < $start_timestamp) {
+                        $rule_time = $start_timestamp;
+                    } elseif ($rule_time > $end_timestamp) {
+                        // اگر امروز تمام شده، به فردای همان بازه
+                        $rule_time = $start_timestamp + (24 * 60 * 60);
+                    }
+                }
+                $scheduled_time = $rule_time;
+                break; // اولین قانون مطابق اعمال می‌شود
+            }
+        }
+        return date('Y-m-d H:i:s', $scheduled_time);
+    }
+    private function schedule_reply($comment_id, $scheduled_time) {
+        // ذخیره اطلاعات در یک option برای پردازش بعدی
+        $scheduled_replies = get_option('_wc_ai_review_scheduled_replies', array());
+        $scheduled_replies[] = array(
+            'comment_id' => $comment_id,
+            'scheduled_time' => $scheduled_time,
+            'status' => 'pending'
+        );
+        update_option('_wc_ai_review_scheduled_replies', $scheduled_replies);
+        // اطمینان از فعال بودن cron job
+        if (!wp_next_scheduled('wc_ai_review_check_scheduled_replies')) {
+            wp_schedule_event(time(), 'minute', 'wc_ai_review_check_scheduled_replies');
+        }
+    }
+    private function is_excluded($comment_id) {
+        $comment = get_comment($comment_id);
+        if (!$comment) {
+            return false;
+        }
+        $post_id = $comment->comment_post_ID;
+        $post_type = get_post_type($post_id);
+        if (isset($this->options['only_products']) && $this->options['only_products'] === '1' && $post_type !== 'product') {
+            return true;
+        }
+        $excluded_post_types = isset($this->options['excluded_post_types']) ? $this->options['excluded_post_types'] : array();
+        if (in_array($post_type, $excluded_post_types)) {
+            return true;
+        }
+        $excluded_products = isset($this->options['excluded_products']) ? $this->options['excluded_products'] : array();
+        if (in_array($post_id, $excluded_products)) {
+            return true;
+        }
+        $global_excluded = get_option('_wc_ai_review_excluded_posts', array());
+        if (in_array($post_id, $global_excluded)) {
+            return true;
+        }
+        if ($post_type === 'product') {
+            $excluded_categories = isset($this->options['excluded_categories']) ? $this->options['excluded_categories'] : array();
+            $product_categories = wp_get_post_terms($post_id, 'product_cat', array('fields' => 'ids'));
+            if (!empty(array_intersect($excluded_categories, $product_categories))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    private function requires_human_intervention_intelligent($customer_comment, $ai_response) {
+        // ساخت یک پرامپت جدید برای تشخیص نیاز به مداخله انسانی
+        $detection_prompt = "You are an AI assistant designed to detect if a customer review requires human intervention. Analyze the customer's comment and the AI-generated response below. Return ONLY 'YES' if human intervention is required, or 'NO' if it is not.
+        Customer Comment:
+        \"{$customer_comment}\"
+        AI Generated Response:
+        \"{$ai_response}\"
+        Does this review require human intervention? (Answer ONLY 'YES' or 'NO')";
+        // فراخوانی API
+        $detection_response = $this->call_ai_api($detection_prompt);
+        if (is_wp_error($detection_response)) {
+            // اگر خطایی رخ داد، فرض می‌کنیم نیاز به مداخله وجود ندارد
+            return false;
+        }
+        // بررسی پاسخ
+        $detection_response = strtoupper(trim($detection_response));
+        return $detection_response === 'YES';
+    }
+    private function create_task_for_manager($comment_id, $reason) {
+        $tasks = get_option('_wc_ai_review_tasks', array());
+        $tasks[] = array(
+            'id' => uniqid(),
+            'comment_id' => $comment_id,
+            'reason' => $reason,
+            'created_at' => current_time('mysql'),
+            'status' => 'pending'
+        );
+        update_option('_wc_ai_review_tasks', $tasks);
+        // ارسال ایمیل به مدیر (اختیاری)
+        $admin_email = get_option('admin_email');
+        $subject = 'وظیفه جدید: نیاز به بررسی انسانی';
+        $message = "یک نظر جدید (#{$comment_id}) نیاز به بررسی انسانی دارد.
+دلیل: {$reason}
+لینک نظر: " . get_comment_link($comment_id);
+        wp_mail($admin_email, $subject, $message);
+    }
+    private function generate_ai_reply($comment_id) {
+        $comment = get_comment($comment_id);
+        if (!$comment) {
+            return new WP_Error('invalid_comment', __('نظر یافت نشد', 'wc-ai-review-reply-pro'));
+        }
+        if ($comment->comment_type !== 'review' && $comment->comment_type !== '') {
+            return new WP_Error('invalid_comment_type', __('این نوع نظر پشتیبانی نمی‌شود', 'wc-ai-review-reply-pro'));
+        }
+        $post_id = $comment->comment_post_ID;
+        if (get_post_type($post_id) === 'product') {
+            $product = wc_get_product($post_id);
+            if (!$product) {
+                return new WP_Error('invalid_product', __('محصول یافت نشد', 'wc-ai-review-reply-pro'));
+            }
+            $product_info = array(
+                'title' => $product->get_name(),
+                'short_description' => $product->get_short_description(),
+                'attributes' => $this->get_product_attributes($product),
+                'description' => $this->trim_description($product->get_description())
+            );
+        } else {
+            $post = get_post($post_id);
+            if (!$post) {
+                return new WP_Error('invalid_post', __('مطلب یافت نشد', 'wc-ai-review-reply-pro'));
+            }
+            $product_info = array(
+                'title' => $post->post_title,
+                'short_description' => wp_trim_words($post->post_excerpt, 20),
+                'attributes' => '',
+                'description' => $this->trim_description($post->post_content)
+            );
+        }
+        if (empty($this->options['api_key'])) {
+            return new WP_Error('api_not_configured', __('API پیکربندی نشده است', 'wc-ai-review-reply-pro'));
+        }
+        // بررسی کلمات ممنوعه
+        $forbidden_keywords = isset($this->options['forbidden_keywords']) ? $this->options['forbidden_keywords'] : '';
+        if (!empty($forbidden_keywords)) {
+            $keywords = explode(',', $forbidden_keywords);
+            foreach ($keywords as $keyword) {
+                $keyword = trim($keyword);
+                if (!empty($keyword) && stripos($comment->comment_content, $keyword) !== false) {
+                    // دریافت متن پیش‌فرض از تنظیمات
+                    $forbidden_response = isset($this->options['forbidden_response']) ? $this->options['forbidden_response'] : 'نظر شما به دلیل حاوی بودن محتوای نامناسب، قابل انتشار نیست.';
+                    return $forbidden_response;
+                }
+            }
+        }
+        // بررسی پاسخ‌های از پیش تعریف شده
+        $canned_response = $this->check_for_canned_response($comment->comment_content);
+        if ($canned_response) {
+            $this->add_log($comment_id, 'canned_response_used', 'پاسخ از پیش تعریف شده استفاده شد');
+            return $canned_response;
+        }
+        $previous_replies = array();
+        if (isset($this->options['learn_from_previous']) && $this->options['learn_from_previous'] === '1') {
+            $previous_replies = $this->get_previous_manager_replies($post_id);
+        }
+        $prompt = $this->build_prompt($product_info, $comment->comment_content, $previous_replies);
+        $response = $this->call_ai_api($prompt);
+        if (is_wp_error($response)) {
+            $this->add_log($comment_id, 'api_error', 'خطا در فراخوانی API', $response->get_error_message());
+            return $response;
+        }
+        // --- افزودن منطق تشخیص هوشمند نیاز به مداخله انسانی ---
+        if ($this->requires_human_intervention_intelligent($comment->comment_content, $response)) {
+            $reason = 'هوش مصنوعی تشخیص داد که این نظر نیاز به مداخله انسانی دارد.';
+            $this->create_task_for_manager($comment_id, $reason);
+            $this->add_log($comment_id, 'human_intervention_required', 'نیاز به مداخله انسانی تشخیص داده شد', $reason);
+            // دریافت پاسخ سفارشی از تنظیمات
+            $custom_response = isset($this->options['human_intervention_response']) ? $this->options['human_intervention_response'] : 'با سلام و احترام، نظر شما دریافت شد و توسط تیم پشتیبانی ما در اسرع وقت بررسی خواهد شد. با تشکر از صبر و همراهی شما.';
+            return $custom_response;
+        }
+        $this->add_log($comment_id, 'reply_generated', 'پاسخ با موفقیت تولید شد', $response);
+        return sanitize_text_field($response);
+    }
+    private function get_product_attributes($product) {
+        $attributes = array();
+        if ($product->is_type('variable')) {
+            $variation_attributes = $product->get_variation_attributes();
+            foreach ($variation_attributes as $attribute => $values) {
+                $attributes[] = $attribute . ': ' . implode(', ', (array) $values);
+            }
+        }
+        $product_attributes = $product->get_attributes();
+        foreach ($product_attributes as $attribute) {
+            if ($attribute->get_visible()) {
+                $attributes[] = $attribute->get_name() . ': ' . implode(', ', $attribute->get_options());
+            }
+        }
+        return implode(', ', $attributes);
+    }
+    private function trim_description($description, $max_length = 500) {
+        $description = wp_strip_all_tags($description);
+        if (mb_strlen($description) > $max_length) {
+            $description = mb_substr($description, 0, $max_length) . '...';
+        }
+        return $description;
+    }
+    public function generate_ai_analysis_ajax() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_die('دسترسی غیرمجاز');
+        }
+        // دریافت تمامی نظرات
+        $comments = get_comments(array(
+            'status' => 'approve',
+            'type' => 'review',
+            'number' => 50, // محدود کردن تعداد برای جلوگیری از مصرف بیش از حد توکن
+            'orderby' => 'comment_date',
+            'order' => 'DESC'
+        ));
+        if (empty($comments)) {
+            wp_send_json_error('هیچ نظری برای تحلیل وجود ندارد.');
+        }
+        // جمع‌آوری متن نظرات
+        $all_comments_text = "لیست نظرات مشتریان:
+";
+        foreach ($comments as $comment) {
+            $rating = get_comment_meta($comment->comment_ID, 'rating', true);
+            $rating_text = $rating ? " (امتیاز: {$rating} از 5)" : "";
+            $all_comments_text .= "نظر کاربر (شناسه: {$comment->comment_ID}){$rating_text}:
+\"{$comment->comment_content}\"
+---
+";
+        }
+        // ساخت پرامپت برای تحلیل
+        $prompt = "شما یک تحلیلگر حرفه‌ای نظرات مشتریان هستید. لطفاً بر اساس نظرات زیر، یک گزارش جامع تهیه کنید.
+متن نظرات:
+{$all_comments_text}
+لطفاً گزارش خود را در قالب HTML با ساختار زیر ارائه دهید:
+1. یک عنوان اصلی با تگ <p> به نام 'خلاصه اجرایی تحلیل نظرات مشتریان'
+2. یک بخش 'آمار کلی' که شامل میانگین امتیاز و تعداد کل نظرات باشد.
+3. یک بخش 'کاربران علاقه‌مند' که لیست کاربرانی که احتمال خرید مجدد یا توصیه محصول را دارند، ذکر کند (با ذکر شناسه نظر و عبارات کلیدی مانند 'حتما دوباره می‌خرم' یا 'به دوستانم پیشنهاد می‌کنم').
+4. یک بخش 'نقاط قوت' که مهم‌ترین مزایای محصول از نظر مشتریان را لیست کند.
+5. یک بخش 'نقاط ضعف' که مهم‌ترین انتقادات مشتریان را لیست کند.
+6. یک بخش 'پیشنهادات' برای بهبود محصول یا خدمات.
+7. در پایان، یک نمودار ساده با استفاده از کتابخانه Chart.js که توزیع امتیازات (مثلاً 5 ستاره، 4 ستاره و ...) را نشان دهد. کد نمودار را در یک div با کلاس 'chart-container' قرار دهید.
+8. تمامی متن‌ها باید به زبان فارسی باشند.
+9. از تگ‌های <p>، <ul>، <li> و <strong> برای قالب‌بندی استفاده کنید. و از p p ... استفاده نکن
+10 . از استیکر استفاده کن و تا جای ممکن تحلیل طولانی و کامل بده
+";
+        // فراخوانی API
+        $response = $this->call_ai_api($prompt);
+        if (is_wp_error($response)) {
+            wp_send_json_error($response->get_error_message());
+        }
+        // ایجاد HTML نهایی
+        $html = '
+        <div class="analysis-report p-6 bg-white rounded-lg shadow">
+            ' . $response . '
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+        jQuery(document).ready(function($) {
+            // رندر نمودارها
+            if (typeof Chart !== "undefined") {
+                $(".chart-container").each(function() {
+                    var ctx = this.getContext("2d");
+                    if (ctx) {
+                        new Chart(ctx, {
+                            type: "bar",
+                             {
+                                labels: ["5 ستاره", "4 ستاره", "3 ستاره", "2 ستاره", "1 ستاره"],
+                                datasets: [{
+                                    label: "توزیع امتیازات",
+                                    data: [12, 8, 3, 2, 1],
+                                    backgroundColor: [
+                                        "rgba(54, 162, 235, 0.2)",
+                                        "rgba(255, 206, 86, 0.2)",
+                                        "rgba(75, 192, 192, 0.2)",
+                                        "rgba(255, 159, 64, 0.2)",
+                                        "rgba(255, 99, 132, 0.2)"
+                                    ],
+                                    borderColor: [
+                                        "rgba(54, 162, 235, 1)",
+                                        "rgba(255, 206, 86, 1)",
+                                        "rgba(75, 192, 192, 1)",
+                                        "rgba(255, 159, 64, 1)",
+                                        "rgba(255, 99, 132, 1)"
+                                    ],
+                                    borderWidth: 1
+                                }]
+                            },
+                            options: {
+                                scales: {
+                                    y: {
+                                        beginAtZero: true
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        </script>
+        ';
+        wp_send_json_success(array('html' => $html));
+    }
+    public function download_analysis_pdf() {
+        check_ajax_referer('wc_ai_review_nonce', 'nonce');
+        if (!current_user_can('manage_options')) {
+            wp_die('دسترسی غیرمجاز');
+        }
+        $html = isset($_GET['html']) ? sanitize_text_field($_GET['html']) : '';
+        if (empty($html)) {
+            wp_die('هیچ داده‌ای برای دانلود وجود ندارد.');
+        }
+        // ساده‌تر: خروجی HTML
+        header('Content-Type: text/html; charset=UTF-8');
+        echo '<!DOCTYPE html><html dir="rtl"><head><meta charset="UTF-8"><title>گزارش تحلیل نظرات</title></head><body>';
+        echo $html;
+        echo '</body></html>';
+        exit;
+    }
+    private function get_previous_manager_replies($post_id, $limit = 4) {
+        $replies = get_comments(array(
+            'post_id' => $post_id,
+            'status' => 'approve',
+            'type' => 'comment',
+            'parent__not_in' => array(0),
+            'number' => $limit,
+            'orderby' => 'comment_date',
+            'order' => 'DESC'
+        ));
+        $manager_replies = array();
+        foreach ($replies as $reply) {
+            $user = get_user_by('id', $reply->user_id);
+            if ($user && (in_array('administrator', $user->roles) || in_array('shop_manager', $user->roles) || $user->ID === $this->ai_user_id)) {
+                $manager_replies[] = $reply->comment_content;
+            }
+        }
+        return $manager_replies;
+    }
+    private function build_prompt($product_info, $customer_comment, $previous_replies) {
+        // تشخیص زبان نظر
+        $detected_lang = $this->detect_language($customer_comment);
+        $supported_languages = isset($this->options['supported_languages']) ? explode(',', $this->options['supported_languages']) : array('fa', 'en');
+        $default_language = isset($this->options['default_language']) ? $this->options['default_language'] : 'fa';
+        // اگر زبان پشتیبانی نمی‌شود، از زبان پیش‌فرض استفاده کن
+        if (!in_array($detected_lang, $supported_languages)) {
+            $target_lang = $default_language;
+        } else {
+            $target_lang = $detected_lang;
+        }
+        // ترجمه دستورالعمل زبان
+        $language_instruction = '';
+        switch ($target_lang) {
+            case 'fa':
+                $language_instruction = 'لطفاً به زبان فارسی پاسخ دهید.';
+                break;
+            case 'en':
+                $language_instruction = 'Please respond in English.';
+                break;
+            case 'ar':
+                $language_instruction = 'الرجاء الرد باللغة العربية.';
+                break;
+            default:
+                $language_instruction = 'Please respond in the same language as the customer.';
+        }
+        // تعیین لحن پاسخ (همانند قبل)
+        $tone_instruction = '';
+        $tone = isset($this->options['tone']) ? $this->options['tone'] : 'professional';
+        switch ($tone) {
+            case 'professional':
+                $tone_instruction = 'Please use a professional and formal tone.';
+                break;
+            case 'friendly':
+                $tone_instruction = 'Please use a friendly and conversational tone.';
+                break;
+            case 'formal':
+                $tone_instruction = 'Please use a very formal and respectful tone.';
+                break;
+            case 'casual':
+                $tone_instruction = 'Please use a casual and informal tone.';
+                break;
+            case 'custom':
+                $custom_tone = isset($this->options['custom_tone']) ? $this->options['custom_tone'] : '';
+                $tone_instruction = $custom_tone;
+                break;
+            case 'learn':
+                $tone_instruction = 'Please mimic the tone and style of the previous manager replies.';
+                break;
+        }
+        $prompt = "You are a helpful support assistant for an online WooCommerce shop.
+Your task is to reply to customer reviews in a helpful and engaging manner.
+{$language_instruction}
+{$tone_instruction}
+Be concise (2-4 sentences), friendly, and professional.
+If the customer complains, offer a practical solution or invite them to contact support.
+Do not mention that you are an AI or any internal processes.
+Product Info:
+Title: {$product_info['title']}
+Short Description: {$product_info['short_description']}
+Key Features: {$product_info['attributes']}
+Summary: {$product_info['description']}
+Customer Review:
+\"{$customer_comment}\"
+Previous Manager Replies (examples):
+";
+        foreach ($previous_replies as $index => $reply) {
+            $prompt .= "
+\"{$reply}\"
+";
+        }
+        $prompt .= "
+Now, write a reply that matches the tone and style.";
+        return $prompt;
+    }
+    private function call_ai_api($prompt) {
+        $provider = isset($this->options['api_provider']) ? $this->options['api_provider'] : 'oneapi';
+        $api_key = $this->options['api_key'];
+        $model = isset($this->options['model']) ? $this->options['model'] : 'gpt-3.5-turbo';
+        $temperature = isset($this->options['temperature']) ? floatval($this->options['temperature']) : 0.7;
+        $max_tokens = isset($this->options['max_tokens']) ? intval($this->options['max_tokens']) : 500;
+        switch ($provider) {
+            case 'openai':
+                $endpoint = isset($this->options['openai_url']) ? $this->options['openai_url'] : 'https://api.openai.com/v1/chat/completions';
+                $headers = array(
+                    'Content-Type' => 'application/json',
+                    'Authorization' => 'Bearer ' . $api_key
+                );
+                break;
+            case 'deepseek':
+                $endpoint = isset($this->options['deepseek_url']) ? $this->options['deepseek_url'] : 'https://api.deepseek.com/v1/chat/completions';
+                $headers = array(
+                    'Content-Type' => 'application/json',
+                    'Authorization' => 'Bearer ' . $api_key
+                );
+                break;
+            case 'oneapi':
+            default:
+                $endpoint = isset($this->options['oneapi_url']) ? $this->options['oneapi_url'] : 'https://api.one-api.ir/openai/v1/chat/completions';
+                $headers = array(
+                    'Content-Type' => 'application/json',
+                    'one-api-token' => $api_key
+                );
+                break;
+        }
+        $body = array(
+            'model' => $model,
+            'messages' => array(
+                array(
+                    'role' => 'system',
+                    'content' => 'You are a helpful customer support representative for an online store.'
+                ),
+                array(
+                    'role' => 'user',
+                    'content' => $prompt
+                )
+            ),
+            'temperature' => $temperature,
+            'max_tokens' => $max_tokens
+        );
+        $response = wp_remote_post($endpoint, array(
+            'headers' => $headers,
+            'body' => json_encode($body),
+            'timeout' => 30
+        ));
+        if (is_wp_error($response)) {
+            return $response;
+        }
+        $response_code = wp_remote_retrieve_response_code($response);
+        $response_body = json_decode(wp_remote_retrieve_body($response), true);
+        if ($response_code !== 200) {
+            return new WP_Error('api_error',
+                __('خطای API: ', 'wc-ai-review-reply-pro') .
+                ($response_body['error']['message'] ?? __('خطای ناشناخته', 'wc-ai-review-reply-pro'))
+            );
+        }
+        // Extract content based on provider
+        if ($provider === 'oneapi') {
+            $content = $response_body['result']['choices'][0]['message']['content'] ?? '';
+        } else {
+            $content = $response_body['choices'][0]['message']['content'] ?? '';
+        }
+        if (empty($content)) {
+            return new WP_Error('invalid_response', __('پاسخ نامعتبر از API', 'wc-ai-review-reply-pro'));
+        }
+        return $content;
+    }
+    public function canned_section_callback() {
+        echo '<p class="text-sm text-gray-600">پاسخ‌های استاندارد برای سوالات متداول را تعریف کنید.</p>';
+    }
+    public function keywords_section_callback() {
+        echo '<p class="text-sm text-gray-600">کلماتی که در صورت وجود در نظر، نیاز به بررسی انسانی دارند.</p>';
+    }
+    public function languages_section_callback() {
+        echo '<p class="text-sm text-gray-600">تنظیمات چندزبانه برای پاسخ‌دهی هوشمند.</p>';
+    }
+    public function canned_responses_render() {
+        $value = isset($this->options['canned_responses']) ? $this->options['canned_responses'] : array();
+        ?>
+        <div id="canned-responses-container">
+            <?php foreach ($value as $index => $item): ?>
+                <div class="canned-response-item mb-4 p-4 border border-gray-200 rounded-md">
+                    <input type="text" name="wc_ai_review_settings[canned_responses][<?php echo $index; ?>][trigger]" placeholder="کلمه کلیدی (مثلاً: هزینه حمل)" value="<?php echo esc_attr($item['trigger'] ?? ''); ?>" class="block w-full mb-2 p-2 border border-gray-300 rounded-md" />
+                    <textarea name="wc_ai_review_settings[canned_responses][<?php echo $index; ?>][response]" placeholder="پاسخ از پیش تعریف شده" rows="3" class="block w-full p-2 border border-gray-300 rounded-md"><?php echo esc_textarea($item['response'] ?? ''); ?></textarea>
+                    <button type="button" class="remove-canned-response mt-2 px-3 py-1 bg-red-500 text-white text-xs rounded-md">حذف</button>
+                </div>
+            <?php endforeach; ?>
+        </div>
+        <button type="button" id="add-canned-response" class="mt-2 px-4 py-2 bg-blue-500 text-white text-sm rounded-md">+ افزودن پاسخ جدید</button>
+        <p class="mt-2 text-xs text-gray-500">اگر نظر کاربر حاوی کلمه کلیدی باشد، پاسخ از پیش تعریف شده جایگزین پاسخ هوش مصنوعی می‌شود.</p>
+        <script>
+            jQuery(document).ready(function($) {
+                $('#add-canned-response').on('click', function() {
+                    var index = $('#canned-responses-container .canned-response-item').length;
+                    var html = `
+                    <div class="canned-response-item mb-4 p-4 border border-gray-200 rounded-md">
+                        <input type="text" name="wc_ai_review_settings[canned_responses][`+index+`][trigger]" placeholder="کلمه کلیدی (مثلاً: هزینه حمل)" class="block w-full mb-2 p-2 border border-gray-300 rounded-md" />
+                        <textarea name="wc_ai_review_settings[canned_responses][`+index+`][response]" placeholder="پاسخ از پیش تعریف شده" rows="3" class="block w-full p-2 border border-gray-300 rounded-md"></textarea>
+                        <button type="button" class="remove-canned-response mt-2 px-3 py-1 bg-red-500 text-white text-xs rounded-md">حذف</button>
+                    </div>
+                `;
+                    $('#canned-responses-container').append(html);
+                });
+                $(document).on('click', '.remove-canned-response', function() {
+                    $(this).closest('.canned-response-item').remove();
+                });
+            });
+        </script>
+        <?php
+    }
+    private function detect_language($text) {
+        // یک پیاده‌سازی ساده برای تشخیص زبان فارسی/انگلیسی
+        $persian_chars = preg_match('/[\x{0600}-\x{06FF}\x{FB8A}\x{067E}\x{0686}\x{06AF}]/u', $text);
+        $english_chars = preg_match('/[a-zA-Z]/', $text);
+        if ($persian_chars && !$english_chars) {
+            return 'fa';
+        } elseif ($english_chars && !$persian_chars) {
+            return 'en';
+        } elseif ($persian_chars && $english_chars) {
+            // اگر هر دو وجود داشت، طول متن فارسی را محاسبه می‌کنیم
+            $persian_length = preg_match_all('/[\x{0600}-\x{06FF}\x{FB8A}\x{067E}\x{0686}\x{06AF}]/u', $text, $matches);
+            if ($persian_length > 10) { // اگر بیش از 10 کاراکتر فارسی داشت
+                return 'fa';
+            } else {
+                return 'en';
+            }
+        }
+        return 'en'; // پیش‌فرض
+    }
+    public function analysis_page() {
+        ?>
+        <div class="wrap" dir="rtl">
+            <p class="wp-heading-inline">تحلیل هوشمند نظرات</p>
+            <hr class="wp-header-end">
+            <div class="notice notice-warning">
+                <p><strong>⚠️ هشدار مصرف توکن:</strong> تحلیل هوشمند نظرات ممکن است تعداد قابل توجهی توکن مصرف کند. لطفاً قبل از اجرا، از موجودی کافی API خود اطمینان حاصل کنید.</p>
+            </div>
+            <div class="bg-white shadow rounded-lg p-6 mb-6">
+                <div class="card-body">
+                    <button type="button" id="start-analysis" class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500">
+                        شروع تحلیل هوشمند
+                    </button>
+                    <span id="analysis-status" class="spinner ml-3" style="display: none;"></span>
+                </div>
+            </div>
+            <div id="analysis-results" style="display: none;" class="bg-white shadow rounded-lg p-6">
+                <p class="text-lg font-semibold mb-4 text-gray-700">نتایج تحلیل</p>
+                <div id="analysis-content"></div>
+                <div class="mt-6">
+                    <button type="button" id="download-analysis-pdf" class="px-4 py-2 bg-gray-200 text-gray-800 text-sm font-medium rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500">
+                        دانلود گزارش به صورت PDF
+                    </button>
+                </div>
+            </div>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                $('#start-analysis').on('click', function() {
+                    if (!confirm('آیا مطمئن هستید؟ این عملیات ممکن است هزینه API بالایی داشته باشد.')) {
+                        return;
+                    }
+                    var $button = $(this);
+                    var $status = $('#analysis-status');
+                    var $results = $('#analysis-results');
+                    var $content = $('#analysis-content');
+                    $button.prop('disabled', true);
+                    $status.show();
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'generate_ai_analysis',
+                            nonce: '<?php echo wp_create_nonce('wc_ai_review_nonce'); ?>'
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $content.html(response.data.html);
+                                $results.show();
+                            } else {
+                                alert('خطا: ' + response.data);
+                            }
+                        },
+                        error: function() {
+                            alert('خطا در ارتباط با سرور');
+                        },
+                        complete: function() {
+                            $button.prop('disabled', false);
+                            $status.hide();
+                        }
+                    });
+                });
+                $(document).on('click', '#download-analysis-pdf', function() {
+                    var analysisHtml = $('#analysis-content').html();
+                    window.open('<?php echo admin_url('admin-ajax.php'); ?>?action=download_analysis_pdf&html=' + encodeURIComponent(analysisHtml) + '&nonce=<?php echo wp_create_nonce('wc_ai_review_nonce'); ?>', '_blank');
+                });
+            });
+        </script>
+        <?php
+    }
+    public function forbidden_keywords_render() {
+        $value = isset($this->options['forbidden_keywords']) ? $this->options['forbidden_keywords'] : '';
+        ?>
+        <textarea name="wc_ai_review_settings[forbidden_keywords]" rows="4" class="block w-full p-2 border border-gray-300 rounded-md" placeholder="کلمات ممنوعه را با کاما جدا کنید&#10;مثلاً: کلمهبد, کلمهنامناسب"><?php echo esc_textarea($value); ?></textarea>
+        <p class="mt-2 text-xs text-gray-500">اگر نظر حاوی این کلمات باشد، به جای پاسخ هوشمند، یک پاسخ پیش‌فرض ارسال شده و نظر برای بررسی انسانی نگه داشته می‌شود.</p>
+        <?php
+    }
+    public function supported_languages_render() {
+        $value = isset($this->options['supported_languages']) ? $this->options['supported_languages'] : 'fa,en';
+        ?>
+        <input type="text" name="wc_ai_review_settings[supported_languages]" value="<?php echo esc_attr($value); ?>" class="block w-full p-2 border border-gray-300 rounded-md" placeholder="fa,en,ar,..." />
+        <p class="mt-2 text-xs text-gray-500">کدهای زبان‌های پشتیبانی شده را با کاما جدا کنید (مثلاً: fa, en, ar).</p>
+        <?php
+    }
+    public function default_language_render() {
+        $value = isset($this->options['default_language']) ? $this->options['default_language'] : 'fa';
+        ?>
+        <input type="text" name="wc_ai_review_settings[default_language]" value="<?php echo esc_attr($value); ?>" class="block w-full p-2 border border-gray-300 rounded-md" placeholder="fa" />
+        <p class="mt-2 text-xs text-gray-500">کد زبان پیش‌فرض سایت (مثلاً: fa برای فارسی).</p>
+        <?php
+    }
+    private function post_reply($comment_id, $reply_content) {
+        $comment = get_comment($comment_id);
+        $reply_user = isset($this->options['reply_user']) ? $this->options['reply_user'] : 'ai';
+        if ($reply_user === 'ai') {
+            $user_id = $this->ai_user_id;
+            $author_name = '🤖 هوش مصنوعی';
+            $author_email = 'ai-assistant@' . wp_parse_url(get_site_url(), PHP_URL_HOST);
+        } else {
+            $user = get_user_by('id', $reply_user);
+            if ($user) {
+                $user_id = $user->ID;
+                $author_name = $user->display_name;
+                $author_email = $user->user_email;
+            } else {
+                $user_id = $this->ai_user_id;
+                $author_name = '🤖 هوش مصنوعی';
+                $author_email = 'ai-assistant@' . wp_parse_url(get_site_url(), PHP_URL_HOST);
+            }
+        }
+        $reply_data = array(
+            'comment_post_ID' => $comment->comment_post_ID,
+            'comment_author' => $author_name,
+            'comment_author_email' => $author_email,
+            'comment_content' => $reply_content,
+            'comment_parent' => $comment_id,
+            'comment_type' => 'comment',
+            'user_id' => $user_id,
+            'comment_approved' => 1
+        );
+        $result = wp_insert_comment($reply_data);
+        if ($result) {
+            $this->add_log($comment_id, 'reply_posted', 'پاسخ با موفقیت ثبت شد', $reply_content);
+            // تنظیم یک transient بلندمدت برای جلوگیری از هرگونه پاسخ تکراری در آینده
+            // این transient تا 30 روز باقی می‌ماند که کاملاً کافی است.
+            set_transient($this->transient_prefix . $comment_id, true, 30 * DAY_IN_SECONDS);
+        } else {
+            $this->add_log($comment_id, 'reply_failed', 'خطا در ثبت پاسخ');
+        }
+        return $result;
+    }
+    // حذف اکشن از لیست نظرات
+    // public function add_ai_reply_action($actions, $comment) {
+    //     // فقط برای نظرات تایید شده و نوع review
+    //     if ($comment->comment_type === 'review' && $comment->comment_approved === '1') {
+    //         $actions['generate_ai_reply'] = sprintf(
+    //             '<a href="#" class="generate-ai-reply text-indigo-600 hover:text-indigo-900 inline-block" data-comment-id="%d">%s</a>',
+    //             $comment->comment_ID,
+    //             __('پاسخ هوشمند', 'wc-ai-review-reply-pro')
+    //         );
+    //         $actions['toggle_exception'] = sprintf(
+    //             '<a href="#" class="toggle-exception text-amber-600 hover:text-amber-900 inline-block" data-comment-id="%d">%s</a>',
+    //             $comment->comment_ID,
+    //             __('حذف/اضافه از استثناها', 'wc-ai-review-reply-pro')
+    //         );
+    //     }
+    //     return $actions;
+    // }
+    public function add_comment_meta_box() {
+        add_meta_box(
+            'wc_ai_review_meta_box',
+            __('پاسخ هوشمند', 'wc-ai-review-reply-pro'),
+            array($this, 'comment_meta_box_content'),
+            'comment',
+            'normal',
+            'high'
+        );
+    }
+    public function comment_meta_box_content($comment) {
+        if ($comment->comment_type !== 'review' || $comment->comment_approved !== '1') {
+            echo '<p class="text-gray-500">پاسخ هوشمند فقط برای نظرات تایید شده محصولات در دسترس است.</p>';
+            return;
+        }
+        echo '<div id="wc-ai-review-metabox" class="space-y-4">';
+        echo '<button type="button" class="generate-ai-reply px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500" data-comment-id="' . $comment->comment_ID . '">تولید پاسخ هوشمند</button>';
+        echo '<button type="button" class="toggle-exception px-4 py-2 bg-amber-600 text-white text-sm font-medium rounded-md hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-amber-500" data-comment-id="' . $comment->comment_ID . '">حذف/اضافه از استثناها</button>';
+        echo '<div id="ai-reply-preview" style="display: none; margin-top: 15px; padding: 15px; background: #f9f9f9; border-radius: 4px;"></div>';
+        echo '</div>';
+    }
+    public function show_admin_notices() {
+        if (empty($this->options['api_key'])) {
+            echo '<div class="notice notice-warning"><p>' .
+                __('برای استفاده از پلاگین پاسخ هوشمند، لطفاً کلید API را در تنظیمات وارد کنید.', 'wc-ai-review-reply-pro') .
+                ' <a href="' . admin_url('admin.php?page=wc-ai-review-settings') . '">' .
+                __('رفتن به تنظیمات', 'wc-ai-review-reply-pro') . '</a></p></div>';
+        }
+        if ($this->ai_user_id === 0 || !get_user_by('id', $this->ai_user_id)) {
+            echo '<div class="notice notice-error"><p>' .
+                __('کاربر هوش مصنوعی وجود ندارد. لطفاً پلاگین را غیرفعال و مجدداً فعال کنید.', 'wc-ai-review-reply-pro') .
+                '</p></div>';
+        }
+    }
+    public function add_post_meta_boxes() {
+        add_meta_box(
+            'wc_ai_review_exclude_meta_box',
+            __('پاسخ هوشمند نظرات', 'wc-ai-review-reply-pro'),
+            array($this, 'post_meta_box_content'),
+            array('post', 'product'),
+            'side',
+            'default'
+        );
+    }
+    public function tasks_page() {
+        ?>
+        <div class="wrap" dir="rtl">
+            <p class="wp-heading-inline">لیست وظایف باز</p>
+            <hr class="wp-header-end">
+            <div class="bg-white shadow rounded-lg overflow-hidden mt-6">
+                <?php
+                $tasks = get_option('_wc_ai_review_tasks', array());
+                $tasks = array_filter($tasks, function($task) {
+                    return $task['status'] === 'pending';
+                });
+                ?>
+                <?php if (empty($tasks)): ?>
+                    <div class="p-8 text-center text-gray-500">
+                        هیچ وظیفه بازی وجود ندارد.
+                    </div>
+                <?php else: ?>
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                        <tr>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">شناسه نظر</th>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">دلیل</th>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">تاریخ ایجاد</th>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">عملیات</th>
+                        </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                        <?php foreach ($tasks as $task): ?>
+                            <tr>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <a href="<?php echo get_comment_link($task['comment_id']); ?>" target="_blank" class="text-indigo-600 hover:text-indigo-900">
+                                        #<?php echo $task['comment_id']; ?>
+                                    </a>
+                                </td>
+                                <td class="px-6 py-4 text-sm text-gray-900">
+                                    <?php echo esc_html($task['reason']); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                    <?php echo date('Y-m-d H:i', strtotime($task['created_at'])); ?>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                    <button type="button" class="complete-task px-3 py-1 bg-green-600 text-white text-xs rounded-md" data-task-id="<?php echo esc_attr($task['id']); ?>">
+                                        تکمیل شد
+                                    </button>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php endif; ?>
+            </div>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                $('.complete-task').on('click', function() {
+                    var taskId = $(this).data('task-id');
+                    var $row = $(this).closest('tr');
+                    $.ajax({
+                        url: '<?php echo admin_url('admin-ajax.php'); ?>',
+                        type: 'POST',
+                        data: {
+                            action: 'complete_ai_task',
+                            task_id: taskId,
+                            nonce: '<?php echo wp_create_nonce('wc_ai_review_nonce'); ?>'
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $row.fadeOut();
+                            } else {
+                                alert('خطا: ' + response.data);
+                            }
+                        }
+                    });
+                });
+            });
+        </script>
+        <?php
+    }
+    public function interested_users_page() {
+        // دریافت لیست تمامی نظرات
+        $comments = get_comments(array(
+            'status' => 'approve',
+            'type' => 'review',
+            'number' => 6,
+            'orderby' => 'comment_date',
+            'order' => 'DESC'
+        ));
+        ?>
+        <div class="wrap" dir="rtl">
+            <div class="bg-white shadow rounded-lg overflow-hidden mt-6">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                    <tr>
+                        <th width="5%" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">#</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">اطلاعات کاربر</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">اطلاعات محصول</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">نظر مشتری</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">عملیات</th>
+                    </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                    <?php if (empty($comments)): ?>
+                        <tr>
+                            <td colspan="5" class="px-6 py-4 text-center text-gray-500">هیچ نظری یافت نشد.</td>
+                        </tr>
+                    <?php else: ?>
+                        <?php foreach ($comments as $index => $comment): ?>
+                            <?php
+                            $user = get_user_by('email', $comment->comment_author_email);
+                            $post = get_post($comment->comment_post_ID);
+                            ?>
+                            <tr>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500"><?php echo $index + 1; ?></td>
+                                <td class="px-6 py-4 text-sm text-gray-900">
+                                    <strong>نام:</strong> <?php echo esc_html($comment->comment_author); ?><br>
+                                    <strong>ایمیل:</strong> <?php echo esc_html($comment->comment_author_email); ?><br>
+                                    <?php if ($user): ?>
+                                        <strong>نام کاربری:</strong> <?php echo esc_html($user->user_login); ?><br>
+                                        <strong>نقش:</strong> <?php echo implode(', ', $user->roles); ?>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="px-6 py-4 text-sm text-gray-900">
+                                    <?php if ($post): ?>
+                                        <strong>عنوان:</strong> <a href="<?php echo get_permalink($post->ID); ?>" target="_blank" class="text-indigo-600 hover:text-indigo-900"><?php echo esc_html($post->post_title); ?></a><br>
+                                        <strong>نوع:</strong> <?php echo esc_html($post->post_type); ?><br>
+                                        <strong>تاریخ انتشار:</strong> <?php echo date('Y-m-d', strtotime($post->post_date)); ?>
+                                    <?php else: ?>
+                                        <em class="text-gray-500">محصول یافت نشد</em>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="px-6 py-4 text-sm text-gray-900">
+                                    <div style="max-width: 400px; word-wrap: break-word;">
+                                        <?php echo wpautop(esc_html($comment->comment_content)); ?>
+                                    </div>
+                                    <small class="text-gray-500">تاریخ نظر: <?php echo date('Y-m-d H:i', strtotime($comment->comment_date)); ?></small>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                    <div class="space-y-2">
+                                        <button type="button" class="generate-ai-reply px-3 py-1 bg-indigo-600 text-white text-xs rounded-md" data-comment-id="<?php echo $comment->comment_ID; ?>">
+                                            تولید پاسخ هوشمند
+                                        </button>
+                                        <div class="flex items-center space-x-2 space-x-reverse">
+                                            <input type="datetime-local" class="scheduled-time px-2 py-1 text-xs border border-gray-300 rounded-md" data-comment-id="<?php echo $comment->comment_ID; ?>" />
+                                            <button type="button" class="schedule-reply px-2 py-1 bg-yellow-600 text-white text-xs rounded-md" data-comment-id="<?php echo $comment->comment_ID; ?>">
+                                                برنامه‌ریزی
+                                            </button>
+                                        </div>
+                                        <div id="ai-reply-container-<?php echo $comment->comment_ID; ?>" class="mt-3" style="display: none;">
+                                            <div class="p-3 bg-green-50 border border-green-200 rounded-md text-sm">
+                                                <strong>پاسخ پیشنهادی:</strong>
+                                                <div id="ai-reply-<?php echo $comment->comment_ID; ?>" class="mt-2"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+            <!-- جدول زمان‌بندی پاسخ‌ها -->
+            <div class="bg-white shadow rounded-lg p-6 mt-8">
+                <p class="text-lg font-semibold mb-4 text-gray-700">زمان‌بندی پاسخ‌ها</p>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                        <tr>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">شناسه نظر</th>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">زمان برنامه‌ریزی شده</th>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">وضعیت</th>
+                            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">عملیات</th>
+                        </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                        <?php
+                        $scheduled_replies = get_option('_wc_ai_review_scheduled_replies', array());
+                        if (empty($scheduled_replies)):
+                            ?>
+                            <tr>
+                                <td colspan="4" class="px-6 py-4 text-center text-gray-500">هیچ پاسخ برنامه‌ریزی شده‌ای وجود ندارد.</td>
+                            </tr>
+                        <?php else: ?>
+                            <?php foreach ($scheduled_replies as $reply): ?>
+                                <tr>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                        #<?php echo $reply['comment_id']; ?>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                        <?php echo date('Y-m-d H:i', strtotime($reply['scheduled_time'])); ?>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                                            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-blue-100 text-blue-800">
+                                                در انتظار ارسال
+                                            </span>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                        <button type="button" class="cancel-scheduled-reply px-2 py-1 bg-red-600 text-white text-xs rounded-md" data-comment-id="<?php echo $reply['comment_id']; ?>">
+                                            لغو
+                                        </button>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                // تولید پاسخ هوشمند
+                $('.generate-ai-reply').on('click', function() {
+                    var $button = $(this);
+                    var commentId = $button.data('comment-id');
+                    var $container = $('#ai-reply-container-' + commentId);
+                    var $replyDiv = $('#ai-reply-' + commentId);
+                    $button.prop('disabled', true).text('در حال تولید...');
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'generate_ai_reply',
+                            comment_id: commentId,
+                            nonce: wc_ai_review.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $replyDiv.html(response.data.reply);
+                                $container.slideDown();
+                            } else {
+                                alert('خطا: ' + response.data);
+                                $button.prop('disabled', false).text('تولید پاسخ هوشمند');
+                            }
+                        },
+                        error: function() {
+                            alert('خطا در ارتباط با سرور');
+                            $button.prop('disabled', false).text('تولید پاسخ هوشمند');
+                        }
+                    });
+                });
+            });
+        </script>
+        <?php
+    }
+    public function post_meta_box_content($post) {
+        $excluded = get_post_meta($post->ID, '_wc_ai_review_excluded', true);
+        wp_nonce_field('wc_ai_review_exclude_nonce', 'wc_ai_review_exclude_nonce');
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_excluded" value="1" <?php checked($excluded, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2 text-sm"><?php _e('غیرفعال کردن پاسخ هوشمند برای این مطلب', 'wc-ai-review-reply-pro'); ?></span>
+        </label>
+        <p class="mt-2 text-xs text-gray-500"><?php _e('اگر این گزینه فعال باشد، برای نظرات این مطلب پاسخ هوشمند تولید نخواهد شد.', 'wc-ai-review-reply-pro'); ?></p>
+        <?php
+    }
+    public function save_post_meta($post_id, $post, $update) {
+        if (!current_user_can('edit_post', $post_id) || !isset($_POST['wc_ai_review_exclude_nonce']) ||
+            !wp_verify_nonce($_POST['wc_ai_review_exclude_nonce'], 'wc_ai_review_exclude_nonce')) {
+            return;
+        }
+        if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) {
+            return;
+        }
+        $excluded = isset($_POST['wc_ai_review_excluded']) ? '1' : '0';
+        update_post_meta($post_id, '_wc_ai_review_excluded', $excluded);
+    }
+    public function show_human_intervention_alert() {
+        // بررسی اینکه آیا این ویژگی فعال است یا خیر
+        if (!isset($this->options['enable_human_intervention_alerts']) || $this->options['enable_human_intervention_alerts'] !== '1') {
+            return;
+        }
+        // دریافت لیست وظایف باز (نیاز به مداخله انسانی)
+        $tasks = get_option('_wc_ai_review_tasks', array());
+        $tasks = array_filter($tasks, function($task) {
+            return $task['status'] === 'pending';
+        });
+        if (empty($tasks)) {
+            return; // هیچ وظیفه بازی وجود ندارد
+        }
+        // نمایش هشدار
+        echo '<div class="notice notice-warning is-dismissible">';
+        echo '<p><strong>⚠️ هشدار مداخله انسانی:</strong> ' . count($tasks) . ' نظر نیاز به بررسی و مداخله انسانی دارد. <a href="' . admin_url('admin.php?page=wc-ai-review-reply') . '">مشاهده وظایف</a></p>';
+        echo '</div>';
+    }
+    public function notifications_section_callback() {
+        echo '<p class="text-sm text-gray-600">تنظیمات مربوط به هشدارهای مدیریتی و پاسخ‌های سفارشی.</p>';
+    }
+    public function enable_human_intervention_alerts_render() {
+        $value = isset($this->options['enable_human_intervention_alerts']) ? $this->options['enable_human_intervention_alerts'] : '0';
+        ?>
+        <label class="inline-flex items-center">
+            <input type="checkbox" name="wc_ai_review_settings[enable_human_intervention_alerts]" value="1" <?php checked($value, '1'); ?> class="rounded border-gray-300 text-indigo-600 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50">
+            <span class="mr-2 text-sm">فعال کردن هشدار مداخله انسانی در داشبورد</span>
+        </label>
+        <p class="mt-2 text-xs text-gray-500">اگر این گزینه فعال باشد، هوش مصنوعی به صورت خودکار نظراتی که نیاز به مداخله انسانی دارند را شناسایی کرده و در داشبورد هشدار می‌دهد.</p>
+        <?php
+    }
+    public function human_intervention_response_render() {
+        $value = isset($this->options['human_intervention_response']) ? $this->options['human_intervention_response'] : 'با سلام و احترام، نظر شما دریافت شد و توسط تیم پشتیبانی ما در اسرع وقت بررسی خواهد شد. با تشکر از صبر و همراهی شما.';
+        ?>
+        <textarea name="wc_ai_review_settings[human_intervention_response]" rows="4" class="block w-full p-2 border border-gray-300 rounded-md" placeholder="پاسخ سفارشی هنگام نیاز به مداخله انسانی"><?php echo esc_textarea($value); ?></textarea>
+        <p class="mt-2 text-xs text-gray-500">این پاسخ زمانی به کاربر ارسال می‌شود که هوش مصنوعی تشخیص دهد نیاز به مداخله انسانی وجود دارد.</p>
+        <?php
+    }
+}
+new WC_AI_Review_Reply_Pro();
+// ایجاد فایل‌های CSS و JS در هنگام فعال‌سازی
+register_activation_hook(__FILE__, 'wc_ai_review_reply_pro_activate');
+function wc_ai_review_reply_pro_activate() {
+
+}
