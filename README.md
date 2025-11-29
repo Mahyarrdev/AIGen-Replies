@@ -71,3 +71,112 @@ After activation, go to **Smart Replies → Settings**.
   Customer said: "{customer_comment}"
   Previous manager replies: {previous_replies}
   Respond in the same language, matching the tone above.
+
+
+
+
+
+
+
+Smart Tools
+Live Preview: Type a sample comment and see the AI’s response instantly.
+Scheduled Replies Dashboard: View and manage delayed responses.
+Pending Human Tasks: Review comments flagged for manual intervention.
+🔒 Security & Best Practices
+✅ API keys never appear in code, version control, or debug logs.
+✅ All user inputs are sanitized using WordPress’s sanitize_text_field and sanitize_textarea_field.
+✅ Admin AJAX endpoints require manage_options capability + valid nonce.
+✅ .gitignore prevents accidental commits of logs or config files.
+✅ Debug mode must be explicitly enabled — logs are not written by default.
+🌐 Multi-Language Support
+Auto-detection: Uses character analysis to detect Persian vs. English.
+Response language: Matches the detected comment language.
+Admin UI: Currently in Persian, but fully internationalizable.
+→ Language files (.pot) coming soon! Contribute translations via /languages/.
+🧩 How It Works
+A user submits a comment or product review.
+If approved and not excluded, the system:
+Checks for canned responses or forbidden keywords.
+Fetches product/post context + recent manager replies.
+Builds a rich prompt with dynamic placeholders.
+Sends request to your chosen AI provider.
+If auto-reply is on, the response is posted immediately (or scheduled).
+If preview mode is on, you see the reply before publishing.
+If the AI suspects high risk (e.g., complaint, legal issue), it:
+Creates a pending task in your dashboard.
+Sends a fallback message (e.g., “We’ll review your feedback shortly”).
+⚡ Replies are processed asynchronously via WordPress cron (minute interval), so page load isn’t blocked.
+
+🛑 Limitations
+Requires internet access to reach AI APIs.
+API costs apply — monitor usage (OneAPI is ~10x cheaper than OpenAI for GPT-4o).
+Not designed for high-frequency sites without usage caps (future: add daily token limits).
+Comments from logged-in admins are ignored (prevents self-dialogue).
+🗑️ Uninstall
+Deleting via Plugins → Delete will:
+
+Remove all plugin settings (wc_ai_review_settings).
+Drop the wp_wc_ai_review_logs table.
+Delete scheduled replies, tasks, and transients.
+Preserve replies (they’re regular WordPress comments).
+💡 To keep settings, just deactivate — don’t delete.
+
+🤝 Contributing
+We welcome:
+
+Bug fixes
+New AI provider integrations (Claude, Gemini, Mistral, etc.)
+UI/UX improvements (Tailwind-based)
+Multi-language admin panels
+PDF/Excel export for analytics
+To contribute:
+
+Fork the repo
+Create your feature branch (git checkout -b feature/your-idea)
+Commit your changes (git commit -am 'Add XYZ')
+Push to the branch (git push origin feature/your-idea)
+Open a Pull Request
+✍️ Please write clear commit messages and test on a real WordPress instance.
+
+📄 License
+This project is licensed under the GNU General Public License v2.0 — the same license as WordPress.
+
+You are free to:
+
+Use commercially
+Modify the code
+Distribute derivatives
+...as long as you share alike under GPL.
+
+🙏 Acknowledgements
+Built on the WordPress Plugin API
+Powered by OpenAI, DeepSeek, and OneAPI.ir
+Inspired by the need for smarter, kinder, and more responsive comment sections
+Uses Chart.js for analytics visualizations
+Persian font via Vazirmatn
+📸 Screenshots
+...
+
+
+💡 Demo video coming soon on YouTube!
+
+💝 Support the Project
+This plugin is free and open-source — but maintaining it takes time and resources.
+
+If you find it valuable, consider:
+
+⭐ Starring this repo
+🐦 Sharing it with fellow developers
+☕ Buying me a coffee → [Link to your donation page]
+❓ Need Help?
+Contact me directly:
+
+Instagram: @mahyardev2
+Telegram: @mahyarrdev
+Or open a GitHub Issue with:
+
+WordPress version
+PHP version
+Steps to reproduce
+Error logs (with sensitive data redacted)
+Make your site more engaging — let AI handle the conversations, while you focus on what matters. 💬✨
