@@ -3,7 +3,7 @@
 AI-powered auto-replies for WordPress comments and WooCommerce reviews — intelligent, secure, and fully controllable.
 
 ---
-![AIGen-Replies](https://github.com/user-attachments/assets/2cc95a74-eb84-4481-8e8e-909bc7d54085)
+
 
 
 
